@@ -1,0 +1,30 @@
+# LLM Providers
+anthropic
+openai
+google-genai
+groq
+cerebras-cloud-sdk
+cartesia
+
+
+# Qt for Rio GUI
+PySide6
+
+# Tools
+requests
+dotenv
+pandas
+python-docx
+openpyxl
+PyPDF2
+pyqtgraph
+mutagen
+mediapipe==0.10.21
+google-genai
+opencv-python==4.11.0.86
+pyaudio
+pillow
+mss
+taskgroup
+PyOpenGL
+trimesh

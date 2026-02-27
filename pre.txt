@@ -1,0 +1,5 @@
+libminizip-dev
+libxcb-cursor0
+portaudio19-dev
+
+
