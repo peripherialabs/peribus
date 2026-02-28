@@ -126,6 +126,8 @@ class AcmeWindow(QFrame):
 
         self.accumulated_code = ""
         self.last_error = ""
+        self._dirty = False
+        self._original_content = ""  # content as loaded from disk
 
         self.llmfs_mount = llmfs_mount
         self.rio_mount = rio_mount
@@ -324,7 +326,9 @@ class AcmeWindow(QFrame):
         elif is_dir:
             cmds = "Del Get Code Main Clear"
         else:
-            cmds = "Del Get Put Code Main Clear"
+            # Only show Put when the file has been modified
+            put_cmd = " Put" if self._dirty else ""
+            cmds = f"Del Undo Redo Get{put_cmd} Code Main Clear"
         self.tag_line.setPlainText(f"{display_path} {cmds}")
 
     def _fit_tag_height(self):
@@ -577,9 +581,11 @@ class AcmeWindow(QFrame):
                 self.text_pane.setPlainText(self.last_error or "(no error)")
                 self.pane_stack.setCurrentIndex(0)
             return
-        if cmd == "Del": self.close_requested.emit(self)
+        if cmd == "Del": self._cmd_del()
         elif cmd == "Get": self._cmd_get()
         elif cmd == "Put": self._cmd_put()
+        elif cmd == "Undo": self._cmd_undo()
+        elif cmd == "Redo": self._cmd_redo()
         elif cmd == "Code":
             self.text_pane.setPlainText(self.accumulated_code)
             self.pane_stack.setCurrentIndex(0)
@@ -602,7 +608,76 @@ class AcmeWindow(QFrame):
                         wd = self.path if self.path and os.path.isdir(self.path) else os.getcwd()
                     col.add_terminal(wd)
 
+    def _cmd_del(self):
+        # If file is dirty, confirm before closing
+        if self._dirty:
+            from PySide6.QtWidgets import QMessageBox
+            msg = QMessageBox()
+            msg.setWindowTitle("Discard changes?")
+            msg.setText(f"{os.path.basename(self.path) if self.path else 'Window'} modified. Discard changes?")
+            msg.setStandardButtons(QMessageBox.Yes | QMessageBox.No)
+            msg.setDefaultButton(QMessageBox.No)
+            msg.setStyleSheet("""
+                QMessageBox {
+                    background-color: #FFFFEA;
+                }
+                QMessageBox QLabel {
+                    color: black;
+                    font-family: 'Consolas', 'Monaco', monospace;
+                    font-size: 13px;
+                    background-color: transparent;
+                }
+                QPushButton {
+                    background-color: #EAEACC;
+                    color: black;
+                    border: 1px solid #888888;
+                    padding: 4px 16px;
+                    font-family: 'Consolas', 'Monaco', monospace;
+                    font-size: 13px;
+                }
+                QPushButton:hover {
+                    background-color: #DDDDB8;
+                }
+            """)
+            if msg.exec() != QMessageBox.Yes:
+                return
+        self.close_requested.emit(self)
+
     def _cmd_get(self):
+        # If file is dirty, confirm before discarding changes
+        if self._dirty:
+            from PySide6.QtWidgets import QMessageBox
+            msg = QMessageBox()
+            msg.setWindowTitle("Discard changes?")
+            msg.setText(f"{os.path.basename(self.path)} modified. Discard changes?")
+            msg.setStandardButtons(QMessageBox.Yes | QMessageBox.No)
+            msg.setDefaultButton(QMessageBox.No)
+            # Override styling so the dialog is readable (parent chain
+            # sets background-color: transparent which cascades here)
+            msg.setStyleSheet("""
+                QMessageBox {
+                    background-color: #FFFFEA;
+                }
+                QMessageBox QLabel {
+                    color: black;
+                    font-family: 'Consolas', 'Monaco', monospace;
+                    font-size: 13px;
+                    background-color: transparent;
+                }
+                QPushButton {
+                    background-color: #EAEACC;
+                    color: black;
+                    border: 1px solid #888888;
+                    padding: 4px 16px;
+                    font-family: 'Consolas', 'Monaco', monospace;
+                    font-size: 13px;
+                }
+                QPushButton:hover {
+                    background-color: #DDDDB8;
+                }
+            """)
+            if msg.exec() != QMessageBox.Yes:
+                return
         words = self.tag_line.toPlainText().strip().split()
         if words:
             p = words[0]
@@ -610,7 +685,10 @@ class AcmeWindow(QFrame):
                 if self.path and os.path.dirname(self.path):
                     p = os.path.join(os.path.dirname(self.path), p)
                 else: p = os.path.abspath(p)
-            self.path = p; self._update_tag_line(); self.load_content()
+            self.path = p
+            self._dirty = False
+            self._update_tag_line()
+            self.load_content()
 
     def _cmd_put(self):
         if not self.path:
@@ -619,9 +697,64 @@ class AcmeWindow(QFrame):
         # will fail naturally
         if not _is_9p_path(self.path) and os.path.isdir(self.path):
             return
+        # Get content from the active file editor widget (graphical pane text_edit)
+        content = self._get_file_editor_content()
+        if content is None:
+            # Fallback to text pane
+            content = self.text_pane.toPlainText()
         try:
-            with open(self.path, 'w') as f: f.write(self.text_pane.toPlainText())
-        except Exception as e: self.last_error = str(e)
+            with open(self.path, 'w') as f:
+                f.write(content)
+            self._dirty = False
+            self._original_content = content
+            self._update_tag_line()
+        except Exception as e:
+            self.last_error = str(e)
+
+    def _get_file_editor_widget(self):
+        """Get the text_edit widget from the graphical pane (file editor).
+        Returns None if no file editor is present."""
+        for i in range(self.graphical_pane_layout.count()):
+            item = self.graphical_pane_layout.itemAt(i)
+            if item:
+                w = item.widget()
+                if w and hasattr(w, 'text_edit'):
+                    return w.text_edit
+        return None
+
+    def _get_file_editor_content(self):
+        """Get text content from the file editor widget in the graphical pane.
+        Returns None if no file editor is present."""
+        te = self._get_file_editor_widget()
+        if te:
+            return te.toPlainText()
+        return None
+
+    def _on_file_editor_changed(self):
+        """Called when the file editor content changes — update dirty state."""
+        te = self._get_file_editor_widget()
+        if te:
+            current = te.toPlainText()
+            was_dirty = self._dirty
+            self._dirty = (current != self._original_content)
+            if was_dirty != self._dirty:
+                self._update_tag_line()
+
+    def _cmd_undo(self):
+        """Undo in the active file editor widget."""
+        te = self._get_file_editor_widget()
+        if te and te.document().isUndoAvailable():
+            te.undo()
+        elif self.text_pane.document().isUndoAvailable():
+            self.text_pane.undo()
+
+    def _cmd_redo(self):
+        """Redo in the active file editor widget."""
+        te = self._get_file_editor_widget()
+        if te and te.document().isRedoAvailable():
+            te.redo()
+        elif self.text_pane.document().isRedoAvailable():
+            self.text_pane.redo()
 
     # ------------------------------------------------------------------
     # Code execution
@@ -692,6 +825,11 @@ class AcmeWindow(QFrame):
             ec.text_edit.setContextMenuPolicy(Qt.NoContextMenu)
             ec.text_edit.viewport().setContextMenuPolicy(Qt.NoContextMenu)
             ec.text_edit.acme_window = self
+            # If this is a file editor (has file_path), set up dirty tracking
+            if hasattr(ec, 'file_path'):
+                self._original_content = ec.text_edit.toPlainText()
+                self._dirty = False
+                ec.text_edit.textChanged.connect(self._on_file_editor_changed)
         if hasattr(ec, 'terminal'):
             ec.terminal.viewport().installEventFilter(self)
             ec.terminal.setContextMenuPolicy(Qt.NoContextMenu)
