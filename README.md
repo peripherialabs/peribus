@@ -152,8 +152,8 @@ Mount remote Peribus machines and distribute work across them:
 
 ```bash
 # Add remote machines
-echo 'add workstation2 192.168.1.50:5642' > /n/ctl
-echo 'add workstation3 192.168.1.51:5642' > /n/ctl
+echo 'add workstation2 192.168.1.50:5641' > /n/ctl
+echo 'add workstation3 192.168.1.51:5641' > /n/ctl
 
 # Then create your /coder — the macro auto-connects everything
 # and compacts the system context across the hive
