@@ -286,23 +286,37 @@ class TSInputFile(SyntheticFile):
 
 
 class TSOutputFile(SyntheticFile):
-    """Text output file - read transcribed text"""
+    """Text output file - read transcribed text.
+    
+    Semantics: each open/read/clunk cycle returns exactly one utterance.
+    The first read blocks until an utterance is available, subsequent
+    reads return b"" (EOF) so that `cat` and similar tools exit after
+    receiving the first complete result.  To get the next utterance,
+    re-open the file (i.e. run `cat` again).
+    """
     
     def __init__(self, agent: 'TSAgent'):
         super().__init__("OUTPUT")
         self.agent = agent
         self._reader_queues: Dict[int, asyncio.Queue] = {}
+        self._delivered: Dict[int, bool] = {}  # track if fid already got its utterance
     
     async def open(self, fid: FidState, mode: int):
         """Create a queue for this reader"""
         self._reader_queues[fid.fid] = asyncio.Queue(maxsize=100)
+        self._delivered[fid.fid] = False
     
     async def close(self, fid: FidState):
         """Remove queue when reader closes"""
         self._reader_queues.pop(fid.fid, None)
+        self._delivered.pop(fid.fid, None)
     
     async def read(self, fid: FidState, offset: int, count: int) -> bytes:
-        """Read transcribed text - blocks until data available"""
+        """Read transcribed text - blocks until first utterance, then EOF."""
+        # Already delivered an utterance on this fid — signal EOF
+        if self._delivered.get(fid.fid, False):
+            return b""
+        
         queue = self._reader_queues.get(fid.fid)
         if queue is None:
             queue = asyncio.Queue(maxsize=100)
@@ -310,6 +324,7 @@ class TSOutputFile(SyntheticFile):
         
         try:
             data = await asyncio.wait_for(queue.get(), timeout=30.0)
+            self._delivered[fid.fid] = True
             return data[:count]
         except asyncio.TimeoutError:
             return b""
@@ -620,12 +635,39 @@ class TSAgent(SyntheticDir):
                 await self.errors.post(f"Text processing error: {e}\n".encode())
     
     async def _process_speech_to_text(self):
-        """Convert audio input to text output using speech_recognition"""
+        """Convert audio input to text output using speech_recognition.
+        
+        Uses energy-based silence detection to segment utterances:
+        - Waits for audio energy to exceed the speech threshold
+        - Accumulates audio while the user is speaking
+        - Once silence is detected for SILENCE_DURATION, transcribes the
+          complete utterance and broadcasts it to OUTPUT
+        """
         if not STT_AVAILABLE:
             await self.errors.post(b"Speech recognition not available\n")
             return
         
+        import audioop
+        
+        # Silence detection parameters
+        SPEECH_THRESHOLD = 500       # RMS level to consider as speech
+        SILENCE_DURATION = 0.75       # Seconds of silence to end utterance
+        MIN_SPEECH_DURATION = 0.3    # Minimum speech duration to process (avoid clicks)
+        MAX_UTTERANCE_SECS = 30      # Maximum utterance length before forced transcription
+        
+        bytes_per_second = SAMPLE_RATE * 2  # 16-bit mono
+        silence_chunks_needed = int(SILENCE_DURATION * SAMPLE_RATE / CHUNK_SIZE)
+        min_speech_bytes = int(MIN_SPEECH_DURATION * bytes_per_second)
+        max_utterance_bytes = int(MAX_UTTERANCE_SECS * bytes_per_second)
+        
         audio_buffer = b""
+        silence_count = 0
+        is_speaking = False
+        
+        await self.errors.post(
+            f"STT: silence detection enabled (threshold={SPEECH_THRESHOLD}, "
+            f"silence={SILENCE_DURATION}s, min_speech={MIN_SPEECH_DURATION}s)\n".encode()
+        )
         
         while self._running:
             try:
@@ -635,43 +677,37 @@ class TSAgent(SyntheticDir):
                     timeout=0.1
                 )
                 
-                # Accumulate audio
-                audio_buffer += chunk
+                # Measure energy
+                rms = audioop.rms(chunk, 2)
                 
-                # Process when we have enough audio (e.g., 2 seconds)
-                min_length = SAMPLE_RATE * 2 * 2  # 2 seconds of 16-bit audio
-                if len(audio_buffer) >= min_length:
-                    self.state = TSState.PROCESSING
+                if rms >= SPEECH_THRESHOLD:
+                    # Speech detected
+                    silence_count = 0
+                    if not is_speaking:
+                        is_speaking = True
+                        self.state = TSState.PROCESSING
+                        await self.errors.post(b"STT: speech started\n")
+                    audio_buffer += chunk
+                elif is_speaking:
+                    # Below threshold but we were speaking — count silence
+                    audio_buffer += chunk  # keep trailing silence for recognizer
+                    silence_count += 1
                     
-                    try:
-                        # Convert to speech_recognition AudioData
-                        audio_data = sr.AudioData(
-                            audio_buffer,
-                            SAMPLE_RATE,
-                            2  # 16-bit = 2 bytes per sample
-                        )
+                    if silence_count >= silence_chunks_needed or len(audio_buffer) >= max_utterance_bytes:
+                        # End of utterance detected
+                        if len(audio_buffer) >= min_speech_bytes:
+                            await self.errors.post(
+                                f"STT: utterance ended ({len(audio_buffer) / bytes_per_second:.1f}s), transcribing...\n".encode()
+                            )
+                            await self._transcribe_and_broadcast(audio_buffer)
+                        else:
+                            await self.errors.post(b"STT: utterance too short, discarded\n")
                         
-                        # Transcribe
-                        text = await asyncio.to_thread(
-                            self._recognizer.recognize_google,
-                            audio_data,
-                            language=self.config.language
-                        )
-                        
-                        # Write to output
-                        await self.output.broadcast(f"{text}\n".encode())
-                        
-                    except sr.UnknownValueError:
-                        await self.errors.post(b"Could not understand audio\n")
-                    except sr.RequestError as e:
-                        await self.errors.post(f"STT error: {e}\n".encode())
-                    except Exception as e:
-                        await self.errors.post(f"Transcription error: {e}\n".encode())
-                    
-                    # Clear buffer
-                    audio_buffer = b""
-                    
-                    self.state = TSState.AUTO if self.config.auto_mode else TSState.READY
+                        # Reset state
+                        audio_buffer = b""
+                        silence_count = 0
+                        is_speaking = False
+                        self.state = TSState.AUTO if self.config.auto_mode else TSState.READY
                 
             except asyncio.TimeoutError:
                 continue
@@ -679,6 +715,32 @@ class TSAgent(SyntheticDir):
                 break
             except Exception as e:
                 await self.errors.post(f"Audio input error: {e}\n".encode())
+    
+    async def _transcribe_and_broadcast(self, audio_buffer: bytes):
+        """Transcribe an audio buffer and broadcast the result to OUTPUT."""
+        try:
+            audio_data = sr.AudioData(
+                audio_buffer,
+                SAMPLE_RATE,
+                2  # 16-bit = 2 bytes per sample
+            )
+            
+            text = await asyncio.to_thread(
+                self._recognizer.recognize_google,
+                audio_data,
+                language=self.config.language
+            )
+            
+            if text.strip():
+                await self.output.broadcast(f"{text}\n".encode())
+                await self.errors.post(f"STT: \"{text}\"\n".encode())
+            
+        except sr.UnknownValueError:
+            await self.errors.post(b"STT: could not understand audio\n")
+        except sr.RequestError as e:
+            await self.errors.post(f"STT error: {e}\n".encode())
+        except Exception as e:
+            await self.errors.post(f"Transcription error: {e}\n".encode())
     
     async def _play_audio_output(self):
         """Play generated audio and broadcast to audio_out file"""
