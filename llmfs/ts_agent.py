@@ -576,7 +576,7 @@ class TSAgent(SyntheticDir):
                     await self.errors.post(f"TTS: Requesting audio with format: {output_format}\n".encode())
                     
                     # Use bytes API (not websocket) for more reliable output
-                    bytes_iter = self.cartesia.tts.bytes(
+                    bytes_iter = await self.cartesia.tts.bytes(
                         model_id=self.config.model,
                         transcript=text,
                         voice={
