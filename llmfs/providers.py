@@ -190,7 +190,8 @@ class GeminiProvider(LLMProvider):
                 "parts": parts,
             })
         
-        response = self.client.models.generate_content_stream(
+        # Use the async client (client.aio) for true non-blocking streaming
+        response = await self.client.aio.models.generate_content_stream(
             model=config.model,
             contents=contents,
             config={
@@ -199,7 +200,7 @@ class GeminiProvider(LLMProvider):
             }
         )
         
-        for chunk in response:
+        async for chunk in response:
             if chunk.text:
                 yield chunk.text
 
