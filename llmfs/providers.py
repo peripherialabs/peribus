@@ -333,7 +333,6 @@ class CerebrasProvider(LLMProvider):
         if not self.api_key:
             raise ValueError("CEREBRAS_API_KEY not found")
         
-        # Cerebras uses the 'cerebras' package which provides AsyncCerebras
         from cerebras.cloud.sdk import AsyncCerebras
         self.client = AsyncCerebras(api_key=self.api_key)
     
@@ -343,39 +342,43 @@ class CerebrasProvider(LLMProvider):
     
     def get_models(self) -> List[str]:
         return [
-            "llama3.1-8b",
-            "llama-3.3-70b",
-            "qwen-3-32b",
+            "zai-glm-4.7",
             "gpt-oss-120b",
             "qwen-3-235b-a22b-instruct-2507",
-            "zai-glm-4.7"
+            "llama3.1-8b",
         ]
     
-    # Per-model max_tokens caps for Cerebras
+    # Per-model max_completion_tokens caps for Cerebras.
+    # GLM 4.7 supports up to 128K output but quality degrades at
+    # extreme lengths; keep a sensible default cap.
     MODEL_MAX_TOKENS = {
-        "zai-glm-4.7": 16384,
+        "zai-glm-4.7": 65000,
         "gpt-oss-120b": 16384,
+        "qwen-3-235b-a22b-instruct-2507": 16384,
     }
     DEFAULT_MAX_TOKENS = 8192
 
     async def stream_response(self, config: ProviderConfig) -> AsyncIterator[str]:
         messages = _build_openai_messages(config)
         
-        # Cerebras models have tight max_tokens limits
         cap = self.MODEL_MAX_TOKENS.get(config.model, self.DEFAULT_MAX_TOKENS)
         max_tokens = min(config.max_tokens, cap)
         
-        stream = await self.client.chat.completions.create(
+        # Cerebras uses max_completion_tokens (not max_tokens).
+        # For GLM 4.7 reasoning models, also support disable_reasoning.
+        kwargs = dict(
             model=config.model,
             messages=messages,
             stream=True,
-            max_tokens=max_tokens,
+            max_completion_tokens=max_tokens,
             temperature=config.temperature,
+            top_p=0.95,
         )
         
+        stream = await self.client.chat.completions.create(**kwargs)
+        
         async for chunk in stream:
-            # Cerebras follows the OpenAI response structure
-            if chunk.choices[0].delta.content:
+            if chunk.choices and chunk.choices[0].delta.content:
                 yield chunk.choices[0].delta.content
 
 
