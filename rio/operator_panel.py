@@ -2486,7 +2486,7 @@ class OperatorGraphScene(QGraphicsScene):
     agent_created = Signal(str)
     agent_deleted = Signal(str)
 
-    def __init__(self):
+    def __init__(self, workspace_routes_path: str = ""):
         super().__init__()
         self.setSceneRect(-3000, -3000, 6000, 6000)
 
@@ -2495,6 +2495,9 @@ class OperatorGraphScene(QGraphicsScene):
         self.text_nodes: Dict[str, TextNode] = {}
         self.debug_nodes: Dict[str, DebugNode] = {}
         self.connections: List[Connection] = []
+
+        # The single authoritative routes file (e.g. /n/mux/default/routes)
+        self._workspace_routes_path = workspace_routes_path
 
         # Connection drag state
         self._drag_source_port: Optional[Port] = None
@@ -2757,12 +2760,12 @@ class OperatorGraphScene(QGraphicsScene):
 
     def _write_route_to_filesystem(self, src_path: str, dst_path: str):
         """
-        Create a route by writing to /n/rioa/routes via a background
-        subprocess — the exact equivalent of:
-            echo 'src -> dst' > /n/rioa/routes
+        Create a route by writing to the workspace routes file via a
+        background subprocess — the exact equivalent of:
+            echo 'src -> dst' > /n/workspace/routes
         Runs off the Qt thread so FUSE I/O cannot freeze the UI.
         """
-        routes_path = self._find_routes_file(src_path, dst_path)
+        routes_path = self._resolve_routes_path()
         if routes_path is None:
             return
         route_line = f"{src_path} -> {dst_path}"
@@ -2777,9 +2780,9 @@ class OperatorGraphScene(QGraphicsScene):
 
     def _remove_route_from_filesystem(self, src_path: str, dst_path: str = ""):
         """
-        Remove a route:  echo '-/path/to/source' > /n/rioa/routes
+        Remove a route:  echo '-/path/to/source' > /n/workspace/routes
         """
-        routes_path = self._find_routes_file(src_path, dst_path)
+        routes_path = self._resolve_routes_path()
         if routes_path is None:
             return
         import subprocess
@@ -2791,19 +2794,14 @@ class OperatorGraphScene(QGraphicsScene):
             daemon=True,
         ).start()
 
-    def _find_routes_file(self, src_path: str, dst_path: str = "") -> Optional[str]:
+    def _resolve_routes_path(self) -> Optional[str]:
         """
-        Return the path to the /n/<svc>/routes file that should own this route.
-        Checks which NinePNode mount is a prefix of source or dest.
-        Falls back to the first available service.
+        Return the path to the workspace routes file.
+        All routes are managed through the single workspace routes file
+        (e.g. /n/mux/default/routes).
         """
-        for node in self.ninep_nodes.values():
-            mp = node.mount_path
-            if src_path.startswith(mp + "/") or dst_path.startswith(mp + "/"):
-                return os.path.join(mp, "routes")
-        # Fallback: first service
-        for node in self.ninep_nodes.values():
-            return os.path.join(node.mount_path, "routes")
+        if self._workspace_routes_path:
+            return self._workspace_routes_path
         return None
 
     def remove_connection(self, conn: Connection):
@@ -3401,7 +3399,9 @@ class OperatorPanel(QWidget):
         layout.addWidget(toolbar)
 
         # ── Graph View ───────────────────────────────────────────────────
-        self.scene = OperatorGraphScene()
+        self.scene = OperatorGraphScene(
+            workspace_routes_path=os.path.join(self.rio_mount, "routes")
+        )
         self.view = QGraphicsView(self.scene)
         self.view.setRenderHint(QPainter.Antialiasing)
         self.view.setRenderHint(QPainter.SmoothPixmapTransform)
