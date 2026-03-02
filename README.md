@@ -49,7 +49,7 @@ libxcb-cursor0
 portaudio19-dev
 ```
 
-> **Note:** `portaudio19-dev` is required before `pip install pyaudio` will succeed.
+> **Note:** `portaudio19-dev` is required before installing pyaudio (`uv sync --extra audio`).
 
 ### 2. Install 9pfuse (required for mounting)
 
@@ -81,7 +81,13 @@ Verify it works:
 ### 3. Install Python dependencies
 
 ```bash
-pip install -r requirements.txt
+uv sync
+```
+
+For audio/voice support (requires `portaudio` system library):
+
+```bash
+uv sync --extra audio
 ```
 
 ### 4. Environment

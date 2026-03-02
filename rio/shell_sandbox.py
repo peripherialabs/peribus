@@ -536,7 +536,7 @@ if __name__ == "__main__":
         ("cat /src/main.py | grep def", True),
         ("wc -l /src/*.py", True),
         ("diff /n/old /n/new", True),
-        ("pip install PyAudio", True),
+        ("uv add PyAudio", True),
         
         # Should BLOCK
         ("rm -rf /", False),

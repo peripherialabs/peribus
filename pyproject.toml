@@ -1,0 +1,29 @@
+[project]
+name = "peribus"
+version = "0.1.0"
+description = "A Plan 9-inspired operating environment where LLM agents, a display server, and a multiplexer are exposed as a 9P filesystem."
+requires-python = ">=3.11,<3.13"
+license = "Apache-2.0"
+dependencies = [
+    "anthropic>=0.84.0",
+    "cartesia>=3.0.2",
+    "cerebras-cloud-sdk>=1.67.0",
+    "google-genai>=1.65.0",
+    "groq>=1.0.0",
+    "mediapipe==0.10.21",
+    "mss>=10.1.0",
+    "openai>=2.24.0",
+    "opencv-python==4.11.0.86",
+    "pandas>=3.0.1",
+    "pillow>=12.1.1",
+    "pymupdf>=1.27.1",
+    "pyopengl>=3.1.10",
+    "pyqtgraph>=0.14.0",
+    "pyside6>=6.10.2",
+    "python-dotenv>=1.2.2",
+    "requests>=2.32.5",
+    "trimesh>=4.11.2",
+]
+
+[project.optional-dependencies]
+audio = ["pyaudio>=0.2.14", "SpeechRecognition>=3.8"]
