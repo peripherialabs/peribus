@@ -125,9 +125,34 @@ AGENT_PROFILES = {
         "right_lash_angle_offset": -10,
         "label_color": QColor(80, 210, 120),
     },
+    "coder_ts": {
+        "display_name": "+",
+        "agent_name": "coder_ts",                        # dedicated coder_ts agent dir
+        "init_cmd": None,                                 # special: not a single ctl command
+        "default_voice": None,                            # voice managed by ts agent
+        "config_extra": {},
+        "iris_color": QColor(160, 70, 210),               # left eye — violet (coder)
+        "iris_rim_color": QColor(90, 30, 140),
+        "right_iris_color": QColor(60, 170, 190),          # right eye — teal (ts)
+        "right_iris_rim_color": QColor(25, 100, 120),
+        "eye_width_scale": 1.08,                          # between grok 1.06 and gpt 1.10
+        "eye_height_scale": 0.95,                         # same as both
+        "outer_corner_lift": 11,                          # between grok 14 and gpt 8
+        "inner_corner_drop": -5,                          # between grok -4 and gpt -6
+        "upper_lid_curve_boost": 3,                       # between grok 8 and gpt -2
+        "eyebrow_y_offset": -4,                           # between grok -6 and gpt -2
+        "eyebrow_arch": 3,                                # between grok 5 and gpt 0
+        "eyebrow_thickness": 3.1,                         # between grok 3.2 and gpt 3.0
+        "lid_thickness": 3.4,                             # between grok 3.5 and gpt 3.2
+        "lower_lid_thickness": 1.1,                       # between grok 1.0 and gpt 1.2
+        "eyelash_density": 58,                            # between grok 60 and gpt 55
+        "eyelash_length": 0.75,                           # between grok 0.8 and gpt 0.7
+        "right_lash_angle_offset": -10,                   # same as gpt
+        "label_color": QColor(170, 90, 230),
+    },
 }
 
-AGENT_ORDER = ["grok", "gemini", "gpt"]
+AGENT_ORDER = ["grok", "gemini", "gpt", "coder_ts"]
 
 # ── Long-press configuration ─────────────────────────────────────────────────
 LONG_PRESS_THRESHOLD_MS = 600   # hold ≥600ms → long press
@@ -144,6 +169,10 @@ MASTER_PROFILES = {
     },
     "gpt": {
         "voice": "ash",                        # male OpenAI voice
+        "system_prompt": "./systems/audiovisual_master.md",
+    },
+    "coder_ts": {
+        "voice": None,                         # voice managed by ts agent
         "system_prompt": "./systems/audiovisual_master.md",
     },
 }
@@ -219,6 +248,7 @@ class AIVoiceControlWidget(QWidget):
         self._agents_created = set()  # tracks which agents have been init'd via /n/llm/ctl
         self._active_backend = None   # which agent_key currently owns the 'av' dir
         self._active_route = None     # (source, destination) tuple for current code→scene route
+        self._coder_ts_routes = []    # list of (source, dest) for coder_ts bidirectional routes
         self._master_mode = False     # True when long-press activated (male voice / master prompt)
 
         # ── Label fade animation ─────────────────────────────────────────
@@ -444,10 +474,17 @@ class AIVoiceControlWidget(QWidget):
         1. Create agent via /n/llm/ctl  (if dir doesn't exist)
         2. Write config  (voice, functions, tool_choice, etc.)
         3. Write system prompt from ./systems/audiovisual.md
+
+        Special case: coder_ts ("+") uses ts + coder agents instead of
+        a websocket AV agent. See _ensure_coder_ts_created().
         """
         key = self._agent_key
         if key in self._agents_created:
             return True
+
+        # Special path for coder_ts: uses ts + coder instead of AV websocket
+        if key == "coder_ts":
+            return self._ensure_coder_ts_created()
 
         p = self._profile
         agent_name = p["agent_name"]   # always "av"
@@ -562,10 +599,160 @@ class AIVoiceControlWidget(QWidget):
         self._active_backend = key
         return True
 
+    def _ensure_coder_ts_created(self):
+        """Special setup for the coder_ts ('+') agent.
+
+        Instead of a single websocket AV agent, this creates TWO agents
+        and wires them together:
+
+        1. Create a 'ts' agent (TTS/STT via Cartesia + speech_recognition)
+        2. Create a 'coder_ts' agent (standard LLM coder)
+        3. System prompt = coder.md + coder_ts.md concatenated
+        4. Set echo auto on > ts/ctl  (auto-listen mode)
+        5. Add coder rules (per-machine fenced code extraction)
+        6. Add TTS rule: ```tts blocks → TTS supplementary output
+        7. Routes:
+           - coder_ts/TTS  → ts/input   (LLM speech output → TTS)
+           - ts/OUTPUT      → coder_ts/input  (STT transcription → LLM)
+        """
+        key = self._agent_key
+        llmfs_ctl = os.path.join(self.llmfs_mount, "ctl")
+        ts_dir = os.path.join(self.llmfs_mount, "ts")
+        coder_dir = os.path.join(self.llmfs_mount, "coder_ts")
+
+        # Step 0: If a different backend owns the av slot, tear it down
+        if self._active_backend is not None and self._active_backend != key:
+            self._destroy_agent()
+
+        # Step 1: Create the ts agent (TTS/STT)
+        if not os.path.isdir(ts_dir):
+            try:
+                with open(llmfs_ctl, 'w') as f:
+                    f.write("ts ts\n")
+                print("[AIVoice+] ts agent created")
+            except Exception as e:
+                print(f"[AIVoice+] Failed to create ts agent: {e}")
+                return False
+
+        # Step 2: Create the coder_ts agent (standard LLM)
+        if not os.path.isdir(coder_dir):
+            try:
+                with open(llmfs_ctl, 'w') as f:
+                    f.write("new coder_ts\n")
+                print("[AIVoice+] coder_ts agent created")
+            except Exception as e:
+                print(f"[AIVoice+] Failed to create coder_ts agent: {e}")
+                return False
+
+        # Step 3: Write system prompt (coder.md + coder_ts.md concatenated)
+        try:
+            system_path = os.path.join(coder_dir, "system")
+            parts = []
+            for prompt_file in ("./systems/coder.md", "./systems/coder_ts.md"):
+                if os.path.exists(prompt_file):
+                    with open(prompt_file, 'r') as f:
+                        parts.append(f.read())
+                else:
+                    print(f"[AIVoice+] {prompt_file} not found, skipping")
+            if parts:
+                with open(system_path, 'w') as f:
+                    f.write("\n\n".join(parts))
+                print("[AIVoice+] System prompt configured (coder.md + coder_ts.md)")
+            else:
+                print("[AIVoice+] No system prompt files found")
+        except Exception as e:
+            print(f"[AIVoice+] Failed to set system prompt: {e}")
+
+        # Step 4: Enable machine registration + limited history on coder_ts
+        try:
+            coder_ctl = os.path.join(coder_dir, "ctl")
+            with open(coder_ctl, 'w') as f:
+                f.write("register on\n")
+            with open(coder_ctl, 'w') as f:
+                f.write("max_history 5\n")
+            print("[AIVoice+] coder_ts: register on, max_history 5")
+        except Exception as e:
+            print(f"[AIVoice+] coder_ts ctl config failed: {e}")
+
+        # Step 5: Add TTS plumbing rule to coder_ts
+        # This extracts ```tts ... ``` blocks into a TTS supplementary output file
+        try:
+            rules_path = os.path.join(coder_dir, "rules")
+            with open(rules_path, 'w') as f:
+                f.write("tts\n")
+            print("[AIVoice+] TTS plumbing rule added to coder_ts")
+        except Exception as e:
+            print(f"[AIVoice+] Failed to add TTS rule: {e}")
+
+        # Step 6: Enable auto mode on ts agent (start listening)
+        try:
+            ts_ctl = os.path.join(ts_dir, "ctl")
+            with open(ts_ctl, 'w') as f:
+                f.write("auto on\n")
+            print("[AIVoice+] ts: auto mode enabled")
+        except Exception as e:
+            print(f"[AIVoice+] ts auto mode failed: {e}")
+
+        self._agents_created.add(key)
+        self._active_backend = key
+        return True
+
+    def _destroy_coder_ts(self):
+        """Tear down the coder_ts + ts agent pair.
+
+        1. Stop ts auto mode
+        2. Delete coder_ts and ts agents via llmfs ctl
+        3. Reset tracking state
+        """
+        llmfs_ctl = os.path.join(self.llmfs_mount, "ctl")
+        ts_dir = os.path.join(self.llmfs_mount, "ts")
+        coder_dir = os.path.join(self.llmfs_mount, "coder_ts")
+
+        # Stop ts auto mode
+        ts_ctl = os.path.join(ts_dir, "ctl")
+        if os.path.exists(ts_ctl):
+            try:
+                with open(ts_ctl, 'w') as f:
+                    f.write("auto off\n")
+                with open(ts_ctl, 'w') as f:
+                    f.write("stop\n")
+                print("[AIVoice+] ts stopped")
+            except Exception as e:
+                print(f"[AIVoice+] ts stop failed: {e}")
+
+        # Delete agents
+        for name in ("coder_ts", "ts"):
+            try:
+                with open(llmfs_ctl, 'w') as f:
+                    f.write(f"rm {name}\n")
+                print(f"[AIVoice+] Destroyed agent '{name}'")
+            except Exception as e:
+                print(f"[AIVoice+] Failed to destroy '{name}': {e}")
+
+        self._agents_created.clear()
+        self._active_backend = None
+
     def _send_ctl(self, command):
         """Write a command (start/stop) to the agent's ctl file."""
         if not self._ensure_agent_created():
             return
+
+        # Special handling for coder_ts: start/stop ts auto mode
+        if self._agent_key == "coder_ts":
+            ts_ctl = os.path.join(self.llmfs_mount, "ts", "ctl")
+            try:
+                if command == "start":
+                    with open(ts_ctl, 'w') as f:
+                        f.write("auto on\n")
+                    print(f"[AIVoice+] ts auto on")
+                elif command == "stop":
+                    with open(ts_ctl, 'w') as f:
+                        f.write("auto off\n")
+                    print(f"[AIVoice+] ts auto off")
+            except Exception as e:
+                print(f"[AIVoice+] ts ctl failed: {e}")
+            return
+
         ctl_path = self._agent_ctl()
         try:
             with open(ctl_path, 'w') as f:
@@ -585,7 +772,13 @@ class AIVoiceControlWidget(QWidget):
         This frees the 'av' slot for a different backend (gemini/grok/openai).
         Other instances targeting /n/llm/av/ will see the agent disappear and
         reappear under the new backend when the eyes next open.
+
+        Special case: coder_ts uses _destroy_coder_ts() instead.
         """
+        if self._active_backend == "coder_ts":
+            self._destroy_coder_ts()
+            return
+
         agent_dir = os.path.join(self.llmfs_mount, "av")
         llmfs_ctl = os.path.join(self.llmfs_mount, "ctl")
 
@@ -673,16 +866,95 @@ class AIVoiceControlWidget(QWidget):
         threading.Thread(target=_write, daemon=True).start()
 
     def _ensure_code_route(self):
-        """Set up $av/CODE → {rio_mount}/scene/parse route for the current agent."""
+        """Set up routes for the current agent.
+
+        Standard AV agents: $av/CODE → {rio_mount}/scene/parse
+        coder_ts ('+'):
+          - coder_ts/TTS    → ts/input     (LLM speech → TTS)
+          - ts/OUTPUT        → coder_ts/input  (STT → LLM)
+          - coder_ts/{MACHINE} → {workspace}/scene/parse (per-machine code output)
+        """
+        if self._agent_key == "coder_ts":
+            self._ensure_coder_ts_routes()
+            return
+
         agent_name = self._profile["agent_name"]
         code_source = os.path.join(self.llmfs_mount, agent_name, "CODE")
         if not self._master_mode:
             self._write_mux_route(code_source, self.scene_parse)
 
     def _teardown_code_route(self):
-        """Remove the CODE→scene route for the current agent."""
+        """Remove routes for the current agent."""
+        if self._agent_key == "coder_ts":
+            self._teardown_coder_ts_routes()
+            return
+
         if self._active_route:
             self._remove_mux_route(self._active_route[0])
+
+    def _ensure_coder_ts_routes(self):
+        """Set up the bidirectional routes for coder_ts + ts.
+
+        Route 1: coder_ts/TTS → ts/input
+            When the LLM generates a ```tts ... ``` block, the plumbing rule
+            extracts the text into the TTS supplementary output file. This
+            route feeds that text into the ts agent for speech synthesis.
+
+        Route 2: ts/OUTPUT → coder_ts/input
+            When the user speaks and ts transcribes it, the text appears
+            on ts/OUTPUT. This route feeds the transcription into the
+            coder_ts LLM agent as a new prompt.
+
+        Route 3+: Per-machine workspace routes (same as /coder)
+            coder_ts/{MACHINE} → {workspace}/scene/parse
+        """
+        coder_dir = os.path.join(self.llmfs_mount, "coder_ts")
+        ts_dir = os.path.join(self.llmfs_mount, "ts")
+
+        # Route 1: coder_ts/TTS → ts/input (LLM speech output → TTS)
+        tts_source = os.path.join(coder_dir, "TTS")
+        ts_input = os.path.join(ts_dir, "input")
+        self._write_mux_route(tts_source, ts_input)
+        self._coder_ts_routes = [(tts_source, ts_input)]
+
+        # Route 2: ts/OUTPUT → coder_ts/input (STT → LLM)
+        ts_output = os.path.join(ts_dir, "OUTPUT")
+        coder_input = os.path.join(coder_dir, "input")
+        self._write_mux_route(ts_output, coder_input)
+        self._coder_ts_routes.append((ts_output, coder_input))
+
+        # Route 3+: Per-machine workspace routes
+        # Read machine list from llmfs ctl
+        machines = []
+        llm_ctl = os.path.join(self.llmfs_mount, "ctl")
+        try:
+            with open(llm_ctl, 'r') as f:
+                for line in f:
+                    line = line.strip()
+                    if line.startswith("machines "):
+                        rest = line[len("machines "):].strip()
+                        if rest and rest != "(none)":
+                            machines = rest.split()
+                        break
+        except Exception:
+            pass
+
+        mux_root = os.path.dirname(self.llmfs_mount)
+        for machine in machines:
+            machine_upper = machine.upper()
+            workspace_dir = os.path.join(mux_root, machine)
+            code_source = os.path.join(coder_dir, machine_upper)
+            code_dest = os.path.join(workspace_dir, "scene", "parse")
+            self._write_mux_route(code_source, code_dest)
+            self._coder_ts_routes.append((code_source, code_dest))
+
+        print(f"[AIVoice+] {len(self._coder_ts_routes)} routes established")
+
+    def _teardown_coder_ts_routes(self):
+        """Remove all coder_ts bidirectional routes."""
+        for source, _dest in getattr(self, '_coder_ts_routes', []):
+            self._remove_mux_route(source)
+        self._coder_ts_routes = []
 
     # ── Mouse / scroll events ────────────────────────────────────────────
     def wheelEvent(self, event):
@@ -1492,16 +1764,18 @@ class AIVoiceControlWidget(QWidget):
 
             # Iris
             ir = 26
+            ic = p.get("right_iris_color", p["iris_color"]) if mirror else p["iris_color"]
+            irc = p.get("right_iris_rim_color", p["iris_rim_color"]) if mirror else p["iris_rim_color"]
             grad = QRadialGradient(icx, icy, ir)
-            grad.setColorAt(0.0, p["iris_color"].lighter(130))
-            grad.setColorAt(0.7, p["iris_color"])
-            grad.setColorAt(1.0, p["iris_rim_color"])
+            grad.setColorAt(0.0, ic.lighter(130))
+            grad.setColorAt(0.7, ic)
+            grad.setColorAt(1.0, irc)
             painter.setBrush(QBrush(grad))
-            painter.setPen(QPen(p["iris_rim_color"].darker(130), 1.2))
+            painter.setPen(QPen(irc.darker(130), 1.2))
             painter.drawEllipse(QPointF(icx, icy), ir, ir)
 
             # Fiber lines
-            painter.setPen(QPen(p["iris_rim_color"].darker(110), 0.3))
+            painter.setPen(QPen(irc.darker(110), 0.3))
             for ang, si, eo, co in iris_data['fibers']:
                 r = math.radians(ang)
                 painter.drawLine(
@@ -1512,7 +1786,7 @@ class AIVoiceControlWidget(QWidget):
 
             # Crypts
             painter.setPen(Qt.NoPen)
-            painter.setBrush(QBrush(p["iris_rim_color"].darker(140)))
+            painter.setBrush(QBrush(irc.darker(140)))
             for cx_, cy_, sz in iris_data['crypts']:
                 painter.drawEllipse(
                     QPointF(icx + cx_, icy + cy_), sz, sz)
