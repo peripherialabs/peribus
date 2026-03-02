@@ -85,7 +85,7 @@ class TSState(Enum):
 class TSConfig:
     """Configuration for TS agent"""
     voice: str = CARTESIA_VOICES[0]  # Default to British Lady
-    model: str = "sonic-english"
+    model: str = "sonic-3"
     output_device: Optional[int] = None
     input_device: Optional[int] = None
     auto_mode: bool = False
@@ -105,7 +105,7 @@ class TSConfig:
     def from_dict(cls, d: dict) -> 'TSConfig':
         return cls(
             voice=d.get("voice", CARTESIA_VOICES[0]),
-            model=d.get("model", "sonic-english"),
+            model=d.get("model", "sonic-3"),
             output_device=d.get("output_device"),
             input_device=d.get("input_device"),
             auto_mode=d.get("auto_mode", False),
@@ -217,8 +217,14 @@ class TSCtlHandler(CtlHandler):
                 f"output_level: {self.agent._output_level:.2f}",
                 f"input_device: {self.agent.config.input_device or 'default'}",
                 f"output_device: {self.agent.config.output_device or 'default'}",
+                f"rate_limited: {self.agent._input_rate_stopped}",
             ]
             return "\n".join(lines)
+        
+        elif cmd == "reset":
+            self.agent._input_rate_stopped = False
+            self.agent._input_last_time = 0.0
+            return "Rate-limit auto-stop cleared"
         
         elif cmd == "voices":
             return "\n".join([f"{v}" for v in CARTESIA_VOICES])
@@ -226,7 +232,7 @@ class TSCtlHandler(CtlHandler):
         else:
             raise ValueError(
                 f"Unknown command: {cmd}. "
-                "Available: auto, voice, model, devices, output, input, language, start, stop, restart, status, voices"
+                "Available: auto, voice, model, devices, output, input, language, start, stop, restart, reset, status, voices"
             )
     
     async def get_status(self) -> bytes:
@@ -239,6 +245,7 @@ class TSCtlHandler(CtlHandler):
             f"output_device {self.agent.config.output_device or 'default'}",
             f"input_level {self.agent._input_level:.2f}",
             f"output_level {self.agent._output_level:.2f}",
+            f"rate_limited {self.agent._input_rate_stopped}",
             "",
             "Available devices:",
         ]
@@ -280,6 +287,31 @@ class TSInputFile(SyntheticFile):
         if not text:
             return len(data)
         
+        # Rate-limit: reject if auto-stopped
+        if self.agent._input_rate_stopped:
+            await self.agent.errors.post(
+                b"input BLOCKED: rate-limit auto-stop active. Write 'reset' to ts/ctl to resume.\n"
+            )
+            raise PermissionError(
+                "Rate-limit auto-stop active. Write 'reset' to ts/ctl to resume."
+            )
+        
+        # Rate-limit: max 1 request per second
+        now = time.monotonic()
+        elapsed = now - self.agent._input_last_time
+        if self.agent._input_last_time > 0 and elapsed < 1.0:
+            # Too fast — trigger auto-stop
+            self.agent._input_rate_stopped = True
+            await self.agent.errors.post(
+                f"input AUTO-STOPPED: {elapsed:.3f}s since last request (min 1s). "
+                f"Write 'reset' to ts/ctl to resume.\n".encode()
+            )
+            raise PermissionError(
+                "Rate-limit exceeded (<1s between requests). Auto-stop engaged. "
+                "Write 'reset' to ts/ctl to resume."
+            )
+        
+        self.agent._input_last_time = now
         self._last_input = text
         await self.agent._text_input_queue.put(text)
         return len(data)
@@ -461,6 +493,10 @@ class TSAgent(SyntheticDir):
         self._text_input_queue = asyncio.Queue()
         self._audio_input_queue = asyncio.Queue()
         self._audio_output_queue = asyncio.Queue()
+        
+        # Rate-limiting for ts/input: max 1 request per second
+        self._input_last_time: float = 0.0
+        self._input_rate_stopped: bool = False
         
         # Files
         self.add(CtlFile("ctl", TSCtlHandler(self)))
@@ -651,7 +687,7 @@ class TSAgent(SyntheticDir):
         
         # Silence detection parameters
         SPEECH_THRESHOLD = 500       # RMS level to consider as speech
-        SILENCE_DURATION = 0.75       # Seconds of silence to end utterance
+        SILENCE_DURATION = 0.3       # Seconds of silence to end utterance
         MIN_SPEECH_DURATION = 0.3    # Minimum speech duration to process (avoid clicks)
         MAX_UTTERANCE_SECS = 30      # Maximum utterance length before forced transcription
         
@@ -931,6 +967,7 @@ class TSStatusFile(SyntheticFile):
             f"output_level: {self.agent._output_level:.2f}",
             f"input_device: {self.agent.config.input_device or 'default'}",
             f"output_device: {self.agent.config.output_device or 'default'}",
+            f"rate_limited: {self.agent._input_rate_stopped}",
         ]
         data = ("\n".join(lines) + "\n").encode()
         return data[offset:offset + count]
