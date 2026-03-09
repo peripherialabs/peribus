@@ -2,6 +2,8 @@
 
 A Plan 9-inspired operating environment where LLM agents, a display server, and a multiplexer are exposed as a 9P filesystem. Everything is a file. One `cat` pipes an AI response into a scene parser. One `echo` rewrites reality.
 
+![Peribus demo](demo.gif)
+
 ## ⚠️ DANGER — Read This First
 
 **This software is experimental and has NO security model.** It gives LLM agents direct filesystem and shell access. A single malformed request can wipe your machine — or every machine mounted on your network. **Run only on an isolated, private network with nothing you can't afford to lose.**
