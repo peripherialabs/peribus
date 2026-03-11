@@ -465,6 +465,7 @@ class ParseFile(SyntheticFile):
         self.stderr_file = stderr_file
         self.context_file = context_file
         self._fid_parsers = {}
+        self._fid_decoders = {}  # incremental UTF-8 decoders per fid
     
     async def read(self, fid: FidState, offset: int, count: int) -> bytes:
         parser = self._fid_parsers.get(fid.fid)
@@ -476,10 +477,15 @@ class ParseFile(SyntheticFile):
         try:
             if fid.fid not in self._fid_parsers:
                 self._fid_parsers[fid.fid] = StreamingParser()
+            if fid.fid not in self._fid_decoders:
+                import codecs
+                self._fid_decoders[fid.fid] = codecs.getincrementaldecoder('utf-8')('strict')
             
             parser = self._fid_parsers[fid.fid]
-            text = data.decode('utf-8')
-            parser.feed(text)
+            decoder = self._fid_decoders[fid.fid]
+            text = decoder.decode(data, False)  # False = more data may follow
+            if text:
+                parser.feed(text)
             
             buffer = parser.get_buffer()
             print(f"BUFFER [fid={fid.fid}] ({len(buffer)} chars): {buffer[:50]}...")
@@ -491,6 +497,18 @@ class ParseFile(SyntheticFile):
     
     def clunk(self, fid: FidState):
         """Execute accumulated code when file is closed"""
+        # Flush any remaining bytes from the incremental decoder
+        decoder = self._fid_decoders.pop(fid.fid, None)
+        if decoder:
+            try:
+                tail = decoder.decode(b'', True)  # True = final, flush remaining
+                if tail:
+                    parser = self._fid_parsers.get(fid.fid)
+                    if parser:
+                        parser.feed(tail)
+            except UnicodeDecodeError:
+                pass  # truncated trailing bytes — nothing we can do
+
         parser = self._fid_parsers.get(fid.fid)
         if not parser:
             print(f"WARNING: No parser found for fid={fid.fid}")
