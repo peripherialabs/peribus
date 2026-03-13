@@ -456,7 +456,7 @@ class TSAgent(SyntheticDir):
         super().__init__(name)
         
         if not CARTESIA_AVAILABLE:
-            raise ImportError("Cartesia package not available. Install with: pip install cartesia")
+            raise ImportError("Cartesia package not available. Install with: uv add cartesia")
         
         self.route_manager = route_manager
         
