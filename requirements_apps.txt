@@ -1,0 +1,9 @@
+moderngl
+numpy
+PyGLM
+pyscf
+rdkit
+nibabel
+nilearn
+mne
+ase

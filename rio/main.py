@@ -12,6 +12,7 @@ import logging
 import signal
 import sys
 import os
+import glob
 
 # Add parent directory to path for imports
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
@@ -416,6 +417,480 @@ class DebugOverlayWidget(QWidget):
 
 
 
+# ═══════════════════════════════════════════════════════════════════════════
+# App Launcher Widget — drag-and-drop app icons onto scene
+# ═══════════════════════════════════════════════════════════════════════════
+
+class _AppIconLabel(QLabel):
+    """A single draggable app icon in the launcher."""
+
+    def __init__(self, app_name: str, app_path: str, launcher: 'AppLauncherWidget', parent=None):
+        super().__init__(parent)
+        self.app_name = app_name
+        self.app_path = app_path
+        self.launcher = launcher
+        self._drag_start = None
+
+        display = app_name.replace('_', ' ').replace('-', ' ')
+        icon = self._pick_icon(app_name)
+        self.setText(f"{icon}\n{display}")
+        self.setAlignment(Qt.AlignCenter)
+        self.setWordWrap(True)
+        self.setFixedSize(80, 72)
+        self.setCursor(Qt.OpenHandCursor)
+        self.setStyleSheet("""
+            QLabel {
+                color: #1a1a1a;
+                font-family: 'Consolas', 'Monaco', monospace;
+                font-size: 10px;
+                border-radius: 6px;
+                padding: 4px 2px;
+                background: transparent;
+            }
+            QLabel:hover {
+                background: rgba(0, 0, 0, 25);
+            }
+        """)
+
+    @staticmethod
+    def _pick_icon(name: str) -> str:
+        n = name.lower()
+        mapping = [
+            (['terminal', 'shell', 'console', 'term'], '🖥'),
+            (['chat', 'message', 'talk'], '💬'),
+            (['image', 'photo', 'picture', 'camera', 'img'], '🖼'),
+            (['music', 'audio', 'sound', 'synth'], '🎵'),
+            (['video', 'movie', 'film'], '🎬'),
+            (['game', 'play'], '🎮'),
+            (['chart', 'graph', 'plot', 'data', 'dashboard'], '📊'),
+            (['note', 'text', 'edit', 'write', 'doc'], '📝'),
+            (['web', 'browser', 'http', 'url'], '🌐'),
+            (['map', 'geo', 'location'], '🗺'),
+            (['clock', 'timer', 'time'], '⏱'),
+            (['calc', 'math'], '🧮'),
+            (['file', 'folder', 'dir'], '📁'),
+            (['paint', 'draw', 'canvas', 'art'], '🎨'),
+            (['cube', '3d', 'gl', 'render'], '🧊'),
+            (['debug', 'log', 'monitor'], '🐛'),
+            (['ai', 'llm', 'model', 'neural'], '🧠'),
+            (['search', 'find', 'query'], '🔍'),
+            (['settings', 'config', 'pref'], '⚙'),
+        ]
+        for keywords, icon in mapping:
+            if any(k in n for k in keywords):
+                return icon
+        return '📦'
+
+    def mousePressEvent(self, event):
+        if event.button() == Qt.LeftButton:
+            self._drag_start = event.pos()
+            self.setCursor(Qt.ClosedHandCursor)
+        super().mousePressEvent(event)
+
+    def mouseMoveEvent(self, event):
+        if self._drag_start is not None and (event.pos() - self._drag_start).manhattanLength() > 8:
+            from PySide6.QtGui import QDrag
+            from PySide6.QtCore import QMimeData
+            drag = QDrag(self)
+            mime = QMimeData()
+            mime.setText(self.app_path)
+            mime.setData("application/x-rio-app", self.app_path.encode('utf-8'))
+            drag.setMimeData(mime)
+            drag.exec(Qt.CopyAction)
+            self._drag_start = None
+            self.setCursor(Qt.OpenHandCursor)
+            return
+        super().mouseMoveEvent(event)
+
+    def mouseReleaseEvent(self, event):
+        if event.button() == Qt.LeftButton:
+            start = self._drag_start
+            self._drag_start = None
+            self.setCursor(Qt.OpenHandCursor)
+            if start is not None and (event.pos() - start).manhattanLength() < 8:
+                self.launcher.launch_app(self.app_path, self.app_name)
+        super().mouseReleaseEvent(event)
+
+
+class AppLauncherWidget(QWidget):
+    """
+    Floating icon grid showing available apps from ./apps/*.py.
+
+    Launches apps by writing code to the filesystem's parse file
+    (equivalent to: cat ./apps/app.py > /n/{workspace}/scene/parse),
+    so the code goes through the filesystem executor and appears in CONTEXT.
+
+    Animation:
+      Open  → black border draws clockwise from top-left,
+              then content fades in + shadow grows (0,0)→(45,45).
+      Close → content fades out + shadow shrinks (45,45)→(0,0),
+              then border erases counter-clockwise back to top-left.
+    """
+
+    # Animation phases
+    _PHASE_IDLE = 0
+    _PHASE_BORDER_IN = 1
+    _PHASE_CONTENT_IN = 2
+    _PHASE_VISIBLE = 3
+    _PHASE_CONTENT_OUT = 4
+    _PHASE_BORDER_OUT = 5
+    _PHASE_DONE = 6
+
+    def __init__(self, rio_window: 'RioWindow', parent=None):
+        super().__init__(parent)
+        self.rio_window = rio_window
+        self.setAttribute(Qt.WA_TranslucentBackground, True)
+        self.setAutoFillBackground(False)
+
+        # Animation state
+        self._anim_phase = self._PHASE_IDLE
+        self._anim_t = 0.0          # 0→1 progress within current phase
+        self._anim_timer = None
+        self._border_progress = 0.0  # 0→1 how much border is drawn
+        self._content_opacity = 0.0  # 0→1
+        self._shadow_effect = None
+        self._proxy = None
+        self._on_close_done = None   # callback when close animation finishes
+        self._border_radius = 6
+
+        self._build_ui()
+
+        # Hide content children until border is drawn
+        self._content_frame.setVisible(False)
+
+    def _get_apps_dir(self) -> str:
+        rio_dir = os.path.dirname(os.path.abspath(__file__))
+        project_root = os.path.dirname(rio_dir)
+        return os.path.join(project_root, "apps")
+
+    def _discover_apps(self) -> list:
+        apps_dir = self._get_apps_dir()
+        if not os.path.isdir(apps_dir):
+            return []
+        apps = []
+        for filepath in sorted(glob.glob(os.path.join(apps_dir, "*.py"))):
+            basename = os.path.basename(filepath)
+            if basename.startswith('_'):
+                continue
+            name = basename[:-3]
+            apps.append((name, filepath))
+        return apps
+
+    def _build_ui(self):
+        from PySide6.QtWidgets import QGridLayout
+
+        apps = self._discover_apps()
+
+        outer = QVBoxLayout(self)
+        outer.setContentsMargins(0, 0, 0, 0)
+        outer.setSpacing(0)
+
+        # All visible content goes in this frame
+        self._content_frame = QWidget()
+        self._content_frame.setAttribute(Qt.WA_TranslucentBackground, True)
+        frame_layout = QVBoxLayout(self._content_frame)
+        frame_layout.setContentsMargins(0, 0, 0, 0)
+        frame_layout.setSpacing(0)
+
+        title = QLabel("  📦 Apps")
+        title.setFixedHeight(28)
+        title.setStyleSheet("""
+            QLabel {
+                background-color: rgba(255, 255, 255, 160);
+                color: #000000;
+                font-family: 'Consolas', 'Monaco', monospace;
+                font-size: 12px;
+                font-weight: 600;
+                border: none;
+                padding-left: 8px;
+            }
+        """)
+        frame_layout.addWidget(title)
+
+        body = QWidget()
+        body.setStyleSheet("""
+            QWidget {
+                background-color: rgba(255, 255, 255, 120);
+                border: none;
+            }
+        """)
+        grid = QGridLayout(body)
+        grid.setContentsMargins(8, 8, 8, 8)
+        grid.setSpacing(6)
+
+        if not apps:
+            empty = QLabel("No apps found\nin ./apps/")
+            empty.setAlignment(Qt.AlignCenter)
+            empty.setStyleSheet("color: rgba(0,0,0,100); font-size: 11px;")
+            grid.addWidget(empty, 0, 0)
+        else:
+            cols = max(1, min(4, len(apps)))
+            for idx, (name, path) in enumerate(apps):
+                icon = _AppIconLabel(name, path, self)
+                grid.addWidget(icon, idx // cols, idx % cols)
+
+        frame_layout.addWidget(body)
+        outer.addWidget(self._content_frame)
+
+        n = len(apps) if apps else 1
+        cols = max(1, min(4, n))
+        rows = (n + cols - 1) // cols
+        w = cols * 88 + 16
+        h = 28 + rows * 80 + 16
+        self.setFixedSize(max(w, 160), min(h, 420))
+
+    # ── Paint: animated border + translucent fill ────────────────────
+
+    def paintEvent(self, event):
+        """Draw the border as a partial rounded-rect path based on _border_progress."""
+        if self._border_progress <= 0.0:
+            return
+
+        p = QPainter(self)
+        p.setRenderHint(QPainter.Antialiasing)
+
+        w, h = self.width(), self.height()
+        r = self._border_radius
+        inset = 0.5  # half-pixel inset so the 1px stroke lands inside
+
+        # Fill — white translucent, clipped to the same rounded rect
+        if self._content_opacity > 0.01:
+            fill_alpha = int(140 * self._content_opacity)
+            p.setBrush(QBrush(QColor(255, 255, 255, fill_alpha)))
+            p.setPen(Qt.NoPen)
+            p.drawRoundedRect(QRectF(inset, inset, w - 2 * inset, h - 2 * inset), r, r)
+
+        # Border stroke
+        pen = QPen(QColor(0, 0, 0, 220), 1.0)
+        pen.setCapStyle(Qt.FlatCap)
+        p.setPen(pen)
+        p.setBrush(Qt.NoBrush)
+
+        # Build the full rounded-rect perimeter as a QPainterPath
+        from PySide6.QtGui import QPainterPath
+        full = QPainterPath()
+        rect = QRectF(inset, inset, w - 2 * inset, h - 2 * inset)
+        full.addRoundedRect(rect, r, r)
+
+        # Compute total perimeter length
+        total_len = full.length()
+        draw_len = total_len * min(self._border_progress, 1.0)
+
+        if draw_len >= total_len - 0.5:
+            # Full border
+            p.drawPath(full)
+        else:
+            # Partial: walk the path and extract a trimmed sub-path
+            partial = QPainterPath()
+            # Sample the path in small increments
+            step = max(0.5, draw_len / 400.0)
+            dist = 0.0
+            started = False
+            while dist <= draw_len:
+                pt = full.pointAtPercent(min(dist / total_len, 1.0))
+                if not started:
+                    partial.moveTo(pt)
+                    started = True
+                else:
+                    partial.lineTo(pt)
+                dist += step
+            # Final point
+            pt = full.pointAtPercent(min(draw_len / total_len, 1.0))
+            partial.lineTo(pt)
+            p.drawPath(partial)
+
+        p.end()
+
+    # ── Open animation ───────────────────────────────────────────────
+
+    def animate_open(self, proxy):
+        """Start the open animation sequence."""
+        from PySide6.QtWidgets import QGraphicsDropShadowEffect
+
+        self._proxy = proxy
+        self._border_progress = 0.0
+        self._content_opacity = 0.0
+        self._content_frame.setVisible(False)
+
+        # Pre-create shadow at (0,0)
+        shadow = QGraphicsDropShadowEffect(self)
+        shadow.setBlurRadius(0)
+        shadow.setOffset(QPointF(0, 0))
+        shadow.setColor(QColor(0, 0, 0, 0))
+        proxy.setGraphicsEffect(shadow)
+        self._shadow_effect = shadow
+
+        self._anim_phase = self._PHASE_BORDER_IN
+        self._anim_t = 0.0
+        self._start_timer()
+
+    def _start_timer(self):
+        if self._anim_timer is not None:
+            self._anim_timer.stop()
+            self._anim_timer.deleteLater()
+        self._anim_timer = QTimer(self)
+        self._anim_timer.timeout.connect(self._anim_tick)
+        self._anim_timer.start(16)
+
+    def _stop_timer(self):
+        if self._anim_timer is not None:
+            self._anim_timer.stop()
+            self._anim_timer.deleteLater()
+            self._anim_timer = None
+
+    @staticmethod
+    def _ease(t):
+        """Smoothstep ease-in-out."""
+        t = max(0.0, min(1.0, t))
+        return t * t * (3.0 - 2.0 * t)
+
+    def _anim_tick(self):
+        speed = 0.04  # per tick (~16ms → full phase in ~400ms)
+
+        if self._anim_phase == self._PHASE_BORDER_IN:
+            self._anim_t += speed
+            self._border_progress = self._ease(self._anim_t)
+            self.update()
+            if self._anim_t >= 1.0:
+                self._border_progress = 1.0
+                self._anim_phase = self._PHASE_CONTENT_IN
+                self._anim_t = 0.0
+                self._content_frame.setVisible(True)
+
+        elif self._anim_phase == self._PHASE_CONTENT_IN:
+            self._anim_t += speed
+            t = self._ease(self._anim_t)
+            self._content_opacity = t
+            self._content_frame.setWindowOpacity(t) if hasattr(self._content_frame, 'setWindowOpacity') else None
+            # Style children opacity via stylesheet trick — we paint fill in paintEvent
+            self._content_frame.setStyleSheet(
+                f"QWidget {{ opacity: {t}; }}"
+                if False else ""  # Qt stylesheets don't support opacity; we use paintEvent fill
+            )
+            # Shadow grows
+            if self._shadow_effect:
+                ox = 45.0 * t
+                blur = 10.0 + 35.0 * t
+                alpha = int(180 * t)
+                self._shadow_effect.setOffset(QPointF(ox, ox))
+                self._shadow_effect.setBlurRadius(blur)
+                self._shadow_effect.setColor(QColor(0, 0, 0, alpha))
+            self.update()
+            if self._anim_t >= 1.0:
+                self._content_opacity = 1.0
+                self._anim_phase = self._PHASE_VISIBLE
+                self._stop_timer()
+
+        elif self._anim_phase == self._PHASE_CONTENT_OUT:
+            self._anim_t += speed
+            t = 1.0 - self._ease(self._anim_t)
+            self._content_opacity = max(t, 0.0)
+            # Shadow shrinks
+            if self._shadow_effect:
+                ox = 45.0 * t
+                blur = 10.0 + 35.0 * t
+                alpha = int(180 * t)
+                self._shadow_effect.setOffset(QPointF(ox, ox))
+                self._shadow_effect.setBlurRadius(blur)
+                self._shadow_effect.setColor(QColor(0, 0, 0, alpha))
+            self.update()
+            if self._anim_t >= 1.0:
+                self._content_opacity = 0.0
+                self._content_frame.setVisible(False)
+                self._anim_phase = self._PHASE_BORDER_OUT
+                self._anim_t = 0.0
+
+        elif self._anim_phase == self._PHASE_BORDER_OUT:
+            self._anim_t += speed
+            self._border_progress = 1.0 - self._ease(self._anim_t)
+            self.update()
+            if self._anim_t >= 1.0:
+                self._border_progress = 0.0
+                self._anim_phase = self._PHASE_DONE
+                self._stop_timer()
+                if self._on_close_done:
+                    # Fire callback on next event loop tick
+                    QTimer.singleShot(0, self._on_close_done)
+
+    # ── Close animation ──────────────────────────────────────────────
+
+    def animate_close(self, on_done: callable = None):
+        """Start the close animation (reverse of open). Calls on_done when finished."""
+        self._on_close_done = on_done
+        if self._anim_phase == self._PHASE_VISIBLE:
+            self._anim_phase = self._PHASE_CONTENT_OUT
+            self._anim_t = 0.0
+            self._start_timer()
+        elif self._anim_phase in (self._PHASE_BORDER_IN, self._PHASE_CONTENT_IN):
+            # Mid-open: jump straight to closing from current state
+            self._anim_phase = self._PHASE_CONTENT_OUT
+            self._anim_t = 0.0
+            self._start_timer()
+        else:
+            # Already closing or idle — just fire done
+            if on_done:
+                QTimer.singleShot(0, on_done)
+
+    def _get_parse_file(self):
+        """Get the filesystem's ParseFile to inject code through the proper pipeline."""
+        fs = self.rio_window.rio_server.filesystem
+        if fs and hasattr(fs, 'scene_dir') and hasattr(fs.scene_dir, 'parse_file'):
+            return fs.scene_dir.parse_file
+        return None
+
+    def _inject_via_parse(self, code: str, label: str):
+        """
+        Inject code through the filesystem's parse file.
+
+        This is the in-process equivalent of:
+            cat app.py > /n/{workspace}/scene/parse
+
+        The ParseFile._execute_code() path runs the filesystem's executor
+        and calls context_file.append_code() on success, so the code
+        appears in CONTEXT for the LLM.
+        """
+        parse_file = self._get_parse_file()
+        if parse_file:
+            print(f"[Apps] Injecting {label} through filesystem parse file")
+            asyncio.create_task(parse_file._execute_code(code))
+        else:
+            print(f"[Apps] WARNING: No parse file available, filesystem not ready?")
+
+    def launch_app(self, app_path: str, app_name: str):
+        """Load and execute an app through the filesystem parse pipeline."""
+        if not os.path.exists(app_path):
+            print(f"[Apps] File not found: {app_path}")
+            return
+        try:
+            with open(app_path, 'r', encoding='utf-8') as f:
+                code = f.read()
+        except Exception as e:
+            print(f"[Apps] Failed to read {app_path}: {e}")
+            return
+
+        print(f"[Apps] Launching {app_name} from {app_path}")
+        self._inject_via_parse(code, app_name)
+
+    def launch_app_at(self, app_path: str, app_name: str, scene_x: float, scene_y: float):
+        """Load and execute an app, prepending drop coordinates."""
+        if not os.path.exists(app_path):
+            print(f"[Apps] File not found: {app_path}")
+            return
+        try:
+            with open(app_path, 'r', encoding='utf-8') as f:
+                code = f.read()
+        except Exception as e:
+            print(f"[Apps] Failed to read {app_path}: {e}")
+            return
+
+        # Prepend drop position so the app code can reference _drop_x, _drop_y
+        preamble = f"_drop_x = {scene_x!r}\n_drop_y = {scene_y!r}\n"
+        code = preamble + code
+
+        print(f"[Apps] Launching {app_name} at ({scene_x:.0f}, {scene_y:.0f})")
+        self._inject_via_parse(code, app_name)
+
+
 class RioWindow(QMainWindow):
     """Main Rio window with graphics scene"""
     
@@ -490,6 +965,9 @@ class RioWindow(QMainWindow):
         
         # Initialize Immersive Mode (Ctrl+I)
         self._immersive_mode = install_immersive_mode(self)
+        
+        # App Launcher (hidden by default)
+        self._app_launcher_proxy = None
     
     def _init_executor(self):
         """Initialize the code execution system"""
@@ -775,6 +1253,12 @@ class RioWindow(QMainWindow):
         # Enable mouse tracking
         self.graphics_view.setMouseTracking(True)
         self.graphics_view.viewport().installEventFilter(self)
+        
+        # Enable drag-and-drop for app launcher
+        self.graphics_view.setAcceptDrops(True)
+        self.graphics_view.dragEnterEvent = self._view_drag_enter
+        self.graphics_view.dragMoveEvent = self._view_drag_move
+        self.graphics_view.dropEvent = self._view_drop
     
     def _show_context_menu(self, pos: QPoint):
         """Show context menu on right-click — only on empty scene area"""
@@ -856,6 +1340,7 @@ class RioWindow(QMainWindow):
         menu.triggered.connect(_on_triggered)
         
         _add("New Terminal", self._enter_new_terminal_mode)
+        _add("Apps", self._toggle_app_launcher)
         menu.addSeparator()
         is_visible = self.voice_control_proxy.isVisible()
         _add("Hide AI Voice" if is_visible else "Show AI Voice", self._toggle_voice_control)
@@ -907,6 +1392,98 @@ class RioWindow(QMainWindow):
         self.pop_mode = False
         self.is_creating_terminal = False
         self.graphics_view.setCursor(Qt.ArrowCursor)
+    
+    # ------------------------------------------------------------------
+    # App Launcher
+    # ------------------------------------------------------------------
+
+    def _toggle_app_launcher(self):
+        """Toggle the App Launcher widget on the scene."""
+        if self._app_launcher_proxy is not None:
+            # Close with animation, then remove
+            widget = self._app_launcher_proxy.widget()
+            if widget and hasattr(widget, 'animate_close'):
+                proxy_ref = self._app_launcher_proxy
+                self._app_launcher_proxy = None  # prevent double-toggle
+
+                def _on_done():
+                    w = proxy_ref.widget()
+                    proxy_ref.setWidget(None)
+                    self.graphics_scene.removeItem(proxy_ref)
+                    if w:
+                        w.deleteLater()
+
+                widget.animate_close(on_done=_on_done)
+            else:
+                self._app_launcher_proxy.setWidget(None)
+                self.graphics_scene.removeItem(self._app_launcher_proxy)
+                self._app_launcher_proxy = None
+                if widget:
+                    widget.deleteLater()
+            return
+
+        launcher = AppLauncherWidget(self)
+        self._app_launcher_proxy = self.graphics_scene.addWidget(launcher)
+        self._app_launcher_proxy.setZValue(2000)
+
+        global_pos = QCursor.pos()
+        viewport_pos = self.graphics_view.mapFromGlobal(global_pos)
+        scene_pos = self.graphics_view.mapToScene(viewport_pos)
+        self._app_launcher_proxy.setPos(scene_pos.x(), scene_pos.y())
+
+        # Animate: border draw → content fade in → shadow grow
+        launcher.animate_open(self._app_launcher_proxy)
+
+        self.scene_manager.register_infrastructure(
+            self._app_launcher_proxy, label="app_launcher"
+        )
+
+    def _view_drag_enter(self, event):
+        if event.mimeData().hasFormat("application/x-rio-app"):
+            event.acceptProposedAction()
+        else:
+            event.ignore()
+
+    def _view_drag_move(self, event):
+        if event.mimeData().hasFormat("application/x-rio-app"):
+            event.acceptProposedAction()
+        else:
+            event.ignore()
+
+    def _view_drop(self, event):
+        mime = event.mimeData()
+        if not mime.hasFormat("application/x-rio-app"):
+            event.ignore()
+            return
+
+        app_path = bytes(mime.data("application/x-rio-app")).decode('utf-8')
+        app_name = os.path.splitext(os.path.basename(app_path))[0]
+        drop_pos = self.graphics_view.mapToScene(event.position().toPoint())
+
+        # Close the launcher with animation after drop
+        if self._app_launcher_proxy is not None:
+            widget = self._app_launcher_proxy.widget()
+            proxy_ref = self._app_launcher_proxy
+            self._app_launcher_proxy = None
+
+            def _on_done():
+                w = proxy_ref.widget()
+                proxy_ref.setWidget(None)
+                self.graphics_scene.removeItem(proxy_ref)
+                if w:
+                    w.deleteLater()
+
+            if widget and hasattr(widget, 'animate_close'):
+                widget.animate_close(on_done=_on_done)
+            else:
+                _on_done()
+
+        # Launch through filesystem parse file
+        launcher = AppLauncherWidget(self)
+        launcher.launch_app_at(app_path, app_name, drop_pos.x(), drop_pos.y())
+        launcher.deleteLater()
+
+        event.acceptProposedAction()
     
     def _clear_scene(self):
         """Clear the scene"""
