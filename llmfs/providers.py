@@ -477,6 +477,83 @@ class MoonShotAIProvider(LLMProvider):
                 yield chunk.choices[0].delta.content
 
 
+class OllamaProvider(LLMProvider):
+    """Ollama provider for local models"""
+    
+    def __init__(self, base_url: str = None):
+        self.base_url = base_url or os.getenv("OLLAMA_HOST", "http://localhost:11434")
+        # Ollama exposes an OpenAI-compatible API at /v1
+        api_base = f"{self.base_url.rstrip('/')}/v1"
+        
+        from openai import AsyncOpenAI
+        # Ollama doesn't require an API key but the client needs a non-empty string
+        self.client = AsyncOpenAI(
+            api_key="ollama",
+            base_url=api_base,
+        )
+        
+        # Cache for discovered models
+        self._cached_models: Optional[List[str]] = None
+    
+    @property
+    def name(self) -> str:
+        return "ollama"
+    
+    def get_models(self) -> List[str]:
+        """
+        Return locally available models by querying the Ollama API.
+        
+        Falls back to common defaults if the server is unreachable.
+        """
+        if self._cached_models is not None:
+            return self._cached_models
+        
+        try:
+            import urllib.request
+            import json
+            url = f"{self.base_url.rstrip('/')}/api/tags"
+            req = urllib.request.Request(url, method="GET")
+            with urllib.request.urlopen(req, timeout=3) as resp:
+                data = json.loads(resp.read())
+            models = [m["name"] for m in data.get("models", [])]
+            if models:
+                self._cached_models = models
+                return models
+        except Exception:
+            pass
+        
+        # Fallback suggestions if we can't reach the server
+        return [
+            "llama3.1",
+            "mistral",
+            "gemma2",
+            "qwen2.5",
+            "phi3",
+            "codellama",
+        ]
+    
+    async def stream_response(self, config: ProviderConfig) -> AsyncIterator[str]:
+        messages = _build_openai_messages(config)
+        
+        # Ollama doesn't support max_tokens > model context;
+        # use a conservative cap or let it default
+        kwargs = dict(
+            model=config.model,
+            messages=messages,
+            stream=True,
+            temperature=config.temperature,
+        )
+        # Only set max_tokens if explicitly configured (Ollama can auto-size)
+        if config.max_tokens and config.max_tokens < 64000:
+            kwargs["max_tokens"] = config.max_tokens
+        
+        stream = await self.client.chat.completions.create(**kwargs)
+        
+        async for chunk in stream:
+            if chunk.choices and chunk.choices[0].delta.content:
+                yield chunk.choices[0].delta.content
+
+
 # Provider registry
 _PROVIDERS = {
     "claude": ClaudeProvider,
@@ -486,6 +563,7 @@ _PROVIDERS = {
     "openrouter": OpenRouterProvider,
     "cerebras": CerebrasProvider,
     "moonshot": MoonShotAIProvider,
+    "ollama": OllamaProvider,
 }
 
 _provider_instances: Dict[str, LLMProvider] = {}
