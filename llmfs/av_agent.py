@@ -77,7 +77,8 @@ RECEIVE_SAMPLE_RATE = 24000
 CHUNK_SIZE = 1024
 
 # Default model
-DEFAULT_MODEL = "gemini-2.5-flash-native-audio-preview-12-2025"
+#DEFAULT_MODEL = "gemini-2.5-flash-native-audio-preview-12-2025"
+DEFAULT_MODEL = "gemini-3.1-flash-live-preview"
 
 # Gemini WebSocket endpoint
 GEMINI_WEBSOCKET_HOST = "generativelanguage.googleapis.com"
