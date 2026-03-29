@@ -653,10 +653,8 @@ class AVAgent(SyntheticDir):
         self._running = False
         self._tasks: List[asyncio.Task] = []
         self._audio_in_queue: Optional[asyncio.Queue] = None
-        self._pending_message: Optional[str] = None
-        self._interrupting: bool = False
         self._mic_paused: bool = False
-        self._text_message_event: asyncio.Event = asyncio.Event()
+        self._text_message_queue: asyncio.Queue = asyncio.Queue()
 
         # PyAudio
         self._pya = None
@@ -1003,9 +1001,6 @@ class AVAgent(SyntheticDir):
                         # Audio data (inlineData)
                         inline_data = part.get("inlineData")
                         if inline_data:
-                            # Drop audio while we're interrupting for a text input
-                            if self._interrupting:
-                                continue
                             b64data = inline_data.get("data", "")
                             if b64data:
                                 pcm_data = base64.b64decode(b64data)
@@ -1043,20 +1038,17 @@ class AVAgent(SyntheticDir):
                             source="audio",
                         ))
 
-                # Turn complete — flush audio queue, clear interrupt flag,
-                # and resume mic if it was paused for text input.
+                # Turn complete — flush stale audio queue.
                 if server_content.get("turnComplete"):
                     while self._audio_in_queue and not self._audio_in_queue.empty():
                         self._audio_in_queue.get_nowait()
-                    self._interrupting = False
                     if self._mic_paused:
                         self._mic_paused = False
 
-                # Interrupted
+                # Interrupted — flush stale audio queue.
                 if server_content.get("interrupted"):
                     while self._audio_in_queue and not self._audio_in_queue.empty():
                         self._audio_in_queue.get_nowait()
-                    self._interrupting = False
                     if self._mic_paused:
                         self._mic_paused = False
 
@@ -1229,34 +1221,26 @@ class AVAgent(SyntheticDir):
         """Handle text messages from filesystem input file"""
         while self._running:
             try:
-                # Wait for a message to be signalled
-                await self._text_message_event.wait()
-                self._text_message_event.clear()
+                # Block until a message is enqueued — no polling, no races
+                message = await self._text_message_queue.get()
 
-                if self._pending_message:
-                    message = self._pending_message
-                    self._pending_message = None
+                if message and self._websocket:
+                    self.history.append(Message(
+                        role="user",
+                        content=message,
+                        source="text",
+                    ))
 
-                    if message and self._websocket:
-                        self.history.append(Message(
-                            role="user",
-                            content=message,
-                            source="text",
-                        ))
-
-                        # Gemini clientContent format
-                        text_msg = {
-                            "clientContent": {
-                                "turnComplete": True,
-                                "turns": [
-                                    {
-                                        "role": "user",
-                                        "parts": [{"text": message}]
-                                    }
-                                ]
-                            }
+                    # Use realtimeInput.text — same channel as mic audio.
+                    # This does NOT interrupt model generation (unlike clientContent),
+                    # so there is no _interrupting flag to set, no stuck-audio risk.
+                    # The server derives end-of-turn from activity detection automatically.
+                    text_msg = {
+                        "realtimeInput": {
+                            "text": message
                         }
-                        await self._websocket.send(json.dumps(text_msg))
+                    }
+                    await self._websocket.send(json.dumps(text_msg))
 
             except asyncio.CancelledError:
                 break
@@ -1368,10 +1352,7 @@ class AVAgent(SyntheticDir):
             await self.errors.post(b"Not connected\n")
             return
 
-        # Interrupt current model output (SDK does this internally)
-        self._interrupting = True
-
-        # Drain playback queue to silence current speech immediately
+        # Drain playback queue to silence any currently-playing speech.
         if self._audio_in_queue:
             while not self._audio_in_queue.empty():
                 try:
@@ -1388,10 +1369,9 @@ class AVAgent(SyntheticDir):
             except Exception:
                 pass
 
-        # Dispatch the text message (sent by _handle_text_messages)
+        # Dispatch the text message via queue — _handle_text_messages awaits it
         # Mic keeps running — no pause needed, matching SDK behavior
-        self._pending_message = text
-        self._text_message_event.set()
+        await self._text_message_queue.put(text)
 
     async def send_context(self, text: str):
         """
