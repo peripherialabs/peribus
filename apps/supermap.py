@@ -149,6 +149,16 @@ def _wy_to_lat(wy: float, zoom: float) -> float:
 def _clamp_zoom(z: float) -> float:
     return max(1.0, min(20.0, z))
 
+def _snap_wx(wx: float, cam_wx: float, zoom: float) -> float:
+    """Snap a world-pixel X to the nearest wrapped copy relative to camera."""
+    ws = _world_size(zoom)
+    offset = wx - cam_wx
+    if offset > ws * 0.5:
+        return wx - ws
+    elif offset < -ws * 0.5:
+        return wx + ws
+    return wx
+
 def _clamp_pitch(p: float) -> float:
     return max(0.0, min(60.0, p))
 
@@ -2705,7 +2715,7 @@ def _extract_pois_from_tiles(tile_cache, visible_keys, tile_px, zoom):
     return pois
 
 
-def _build_poi_billboards_fp(pois, cam_wx, cam_wy, mpp, max_dist_m=300.0, max_pois=80):
+def _build_poi_billboards_fp(pois, cam_wx, cam_wy, mpp, zoom, max_dist_m=300.0, max_pois=80):
     """Build cylindrical halo geometry for POIs in first-person immersive mode.
     Each POI gets a glowing cylinder ring on the ground.
     Returns float32 array: x, y, z, nx, ny, nz, r, g, b, a, height_norm, icon_id (12 floats per vert).
@@ -2718,7 +2728,9 @@ def _build_poi_billboards_fp(pois, cam_wx, cam_wy, mpp, max_dist_m=300.0, max_po
     # Sort by distance, filter by range
     scored = []
     for poi in pois:
-        dx = poi["wx"] - cam_wx
+        wx = _snap_wx(poi["wx"], cam_wx, zoom)
+        poi["wx"] = wx
+        dx = wx - cam_wx
         dy = poi["wy"] - cam_wy
         dist = math.hypot(dx, dy)
         if dist < max_dist_px:
@@ -2784,7 +2796,7 @@ def _build_poi_billboards_fp(pois, cam_wx, cam_wy, mpp, max_dist_m=300.0, max_po
     return np.array(all_verts, dtype='f4'), visible_pois
 
 
-def _build_poi_markers_2d(pois, zoom, max_pois=80):
+def _build_poi_markers_2d(pois, zoom, cam_wx=0.0, max_pois=80):
     """Build 2D marker geometry for POIs on the overview map.
     Re-projects lat/lon to current zoom's world-pixel coords.
     Returns float32 array: wx, wy, qx, qy, r, g, b, a, icon_id (9 floats per vert).
@@ -2800,6 +2812,8 @@ def _build_poi_markers_2d(pois, zoom, max_pois=80):
         # Reproject from lat/lon at the CURRENT zoom (not the extraction zoom)
         wx = _lon_to_wx(poi["lon"], zoom)
         wy = _lat_to_wy(poi["lat"], zoom)
+        # Snap to nearest wrapped world copy relative to camera
+        wx = _snap_wx(wx, cam_wx, zoom)
         # Update the cached wx/wy so hit-testing and popups use correct coords
         poi["wx"] = wx
         poi["wy"] = wy
@@ -4468,7 +4482,14 @@ class MapboxWidget(QWidget):
         self._gl_ready = True
         self._ctx = moderngl.create_context(standalone=True)
         self._ctx.enable(moderngl.BLEND)
-        self._ctx.blend_func = (moderngl.SRC_ALPHA, moderngl.ONE_MINUS_SRC_ALPHA)
+        # Separate blend for RGB (normal alpha blend) and A (always keep opaque).
+        # This prevents semi-transparent geometry from punching holes in the FBO
+        # alpha channel, which would cause grey bleed-through when composited
+        # onto the widget via QPainter.
+        self._ctx.blend_func = (
+            moderngl.SRC_ALPHA, moderngl.ONE_MINUS_SRC_ALPHA,
+            moderngl.ONE, moderngl.ONE_MINUS_SRC_ALPHA,
+        )
 
         # v6: geometry shader for direct MVT rendering
         self._prog_geo = self._ctx.program(vertex_shader=GEO_VERT, fragment_shader=GEO_FRAG)
@@ -5432,7 +5453,7 @@ class MapboxWidget(QWidget):
 
         fc = bld_style["fill"]
         base_r, base_g, base_b = fc.red()/255.0, fc.green()/255.0, fc.blue()/255.0
-        base_a = min(0.92, fc.alpha()/255.0)
+        base_a = 1.0  # 3D buildings are always fully opaque (style alpha is for 2D footprints)
         wall_color = (base_r * 0.85, base_g * 0.85, base_b * 0.88, base_a)
         roof_color = (min(1.0, base_r * 1.25 + 0.08), min(1.0, base_g * 1.25 + 0.08),
                       min(1.0, base_b * 1.20 + 0.06), base_a)
@@ -6155,7 +6176,8 @@ class MapboxWidget(QWidget):
         best_dist = hit_radius * hit_radius
         best_poi = None
         for poi in self._poi_cache:
-            wx, wy = poi["wx"], poi["wy"]
+            wx = _snap_wx(poi["wx"], self._cx, z)
+            wy = poi["wy"]
             dx = wx - self._cx; dy = wy - self._cy
             sx = dx * cos_b + dy * sin_b
             sy = -dx * sin_b + dy * cos_b
@@ -6186,7 +6208,7 @@ class MapboxWidget(QWidget):
 
         # If currently showing a popup, check if player is still within stay radius
         if self._poi_popup is not None:
-            dx = self._poi_popup["wx"] - cam_wx
+            dx = _snap_wx(self._poi_popup["wx"], cam_wx, z) - cam_wx
             dy = self._poi_popup["wy"] - cam_wy
             dist = math.hypot(dx, dy)
             if dist < stay_dist_px:
@@ -6201,7 +6223,7 @@ class MapboxWidget(QWidget):
             return
 
         for poi in self._poi_visible_list:
-            dx = poi["wx"] - cam_wx
+            dx = _snap_wx(poi["wx"], cam_wx, z) - cam_wx
             dy = poi["wy"] - cam_wy
             dist = math.hypot(dx, dy)
             if dist < trigger_dist_px:
@@ -6225,7 +6247,7 @@ class MapboxWidget(QWidget):
             cache_key = name.lower().strip()
             if cache_key in self._poi_detail_cache:
                 continue  # already fetched
-            dx = poi["wx"] - cam_wx
+            dx = _snap_wx(poi["wx"], cam_wx, z) - cam_wx
             dy = poi["wy"] - cam_wy
             dist = math.hypot(dx, dy)
             if dist < prefetch_dist_px:
@@ -6247,7 +6269,7 @@ class MapboxWidget(QWidget):
         mpp = (40_075_000 * math.cos(math.radians(lat))) / _world_size(z)
         scored = []
         for poi in src:
-            dx = poi["wx"] - cam_wx
+            dx = _snap_wx(poi["wx"], cam_wx, z) - cam_wx
             dy = poi["wy"] - cam_wy
             dist_m = math.hypot(dx, dy) * mpp
             scored.append((dist_m, poi))
@@ -7030,7 +7052,7 @@ class MapboxWidget(QWidget):
         z = self._zoom
         lat_c = _wy_to_lat(cam_wy, z)
         mpp_c = (40_075_000 * math.cos(math.radians(lat_c))) / _world_size(z)
-        dx_d = poi["wx"] - cam_wx; dy_d = poi["wy"] - cam_wy
+        dx_d = _snap_wx(poi["wx"], cam_wx, z) - cam_wx; dy_d = poi["wy"] - cam_wy
         dist_m = math.hypot(dx_d, dy_d) * mpp_c
         dist_str = f"{dist_m:.0f}m" if dist_m < 1000 else f"{dist_m / 1000:.1f}km"
         painter.setPen(QColor(120, 155, 200, a_int))
@@ -7331,16 +7353,20 @@ class MapboxWidget(QWidget):
                     sy_min = min(sy_min, scr_y)
                     sy_max = max(sy_max, scr_y)
 
-                if scissor_ok:
-                    # Clamp to viewport
-                    ix = max(0, int(math.floor(sx_min)))
-                    iy = max(0, int(math.floor(sy_min)))
-                    ix2 = min(w, int(math.ceil(sx_max)))
-                    iy2 = min(h, int(math.ceil(sy_max)))
-                    sw = ix2 - ix; sh = iy2 - iy
-                    if sw > 0 and sh > 0:
-                        # GL scissor Y is from bottom; setting ctx.scissor enables scissor test
-                        self._ctx.scissor = (ix, h - iy2, sw, sh)
+                if not scissor_ok:
+                    continue  # skip parent tile if scissor rect can't be computed
+
+                # Clamp to viewport
+                ix = max(0, int(math.floor(sx_min)))
+                iy = max(0, int(math.floor(sy_min)))
+                ix2 = min(w, int(math.ceil(sx_max)))
+                iy2 = min(h, int(math.ceil(sy_max)))
+                sw = ix2 - ix; sh = iy2 - iy
+                if sw <= 0 or sh <= 0:
+                    continue  # zero-area scissor rect, skip
+
+                # GL scissor Y is from bottom; setting ctx.scissor enables scissor test
+                self._ctx.scissor = (ix, h - iy2, sw, sh)
 
                 self._prog_geo['tile_offset'].write(
                     np.array([off_x, off_y], dtype='f4').tobytes())
@@ -7351,9 +7377,8 @@ class MapboxWidget(QWidget):
                 if geo['line_vao'] and geo['line_count'] > 0:
                     geo['line_vao'].render(moderngl.TRIANGLES)
 
-                if scissor_ok:
-                    # Restore full viewport (disables scissor)
-                    self._ctx.scissor = None
+                # Restore full viewport (disables scissor)
+                self._ctx.scissor = None
 
             # Pass 2: Draw exact tiles (fills then lines for proper layering)
             if self._tiles_visible:
@@ -7487,7 +7512,7 @@ class MapboxWidget(QWidget):
                     self._rebuild_heatmap_vbo()
                 if self._heatmap_vao and self._heatmap_vert_count > 0:
                     self._ctx.enable(moderngl.BLEND)
-                    self._ctx.blend_func = (moderngl.SRC_ALPHA, moderngl.ONE)
+                    self._ctx.blend_func = (moderngl.SRC_ALPHA, moderngl.ONE, moderngl.ONE, moderngl.ONE_MINUS_SRC_ALPHA)
                     self._prog_heat['view_proj'].write(VP_gl.tobytes())
                     # Read panel values (with defaults when panel is hidden)
                     heat_radius_base = self._get_panel_val("heat_radius", 50.0)
@@ -7498,13 +7523,14 @@ class MapboxWidget(QWidget):
                     self._prog_heat['intensity'].value = float(heat_intensity)
                     self._prog_heat['min_heat'].value = float(heat_filter)
                     self._heatmap_vao.render(moderngl.TRIANGLES)
-                    self._ctx.blend_func = (moderngl.SRC_ALPHA, moderngl.ONE_MINUS_SRC_ALPHA)
+                    self._ctx.blend_func = (moderngl.SRC_ALPHA, moderngl.ONE_MINUS_SRC_ALPHA, moderngl.ONE, moderngl.ONE_MINUS_SRC_ALPHA)
 
             # POI 2D markers (only when tiles visible and not in immersive)
             if self._poi_enabled and self._tiles_visible and self._prog_poi_2d:
-                z_int_2d = max(0, min(20, int(math.floor(self._zoom + 0.5))))
-                tp_2d = TILE_SIZE * (2.0 ** (self._zoom - z_int_2d))
-                n_2d = 2 ** z_int_2d
+                # Use the same z_int and tile_px as tile rendering so we
+                # iterate over tiles that are actually in the cache.
+                n_2d = n
+                tp_2d = tile_px
 
                 # v7: Only re-extract POIs when the visible tile key set changes
                 with self._mvt_lock:
@@ -7513,10 +7539,10 @@ class MapboxWidget(QWidget):
                         for tx_2d in range(col_min, col_max):
                             tx_w_2d = tx_2d % n_2d
                             if tx_w_2d < 0: tx_w_2d += n_2d
-                            tk = (z_int_2d, tx_w_2d, ty_2d)
+                            tk = (z_int, tx_w_2d, ty_2d)
                             if tk in self._mvt_cache:
                                 vis_k.append(tk)
-                    poi_tile_key = (z_int_2d, tuple(sorted(vis_k)))
+                    poi_tile_key = (z_int, tuple(sorted(vis_k)))
                     need_poi_extract = (poi_tile_key != getattr(self, '_poi_tile_key_v7', None))
                     if need_poi_extract:
                         snap = {k: self._mvt_cache[k] for k in vis_k if k in self._mvt_cache}
@@ -7525,10 +7551,10 @@ class MapboxWidget(QWidget):
                     self._poi_tile_key_v7 = poi_tile_key
                     self._poi_2d_dirty = True
 
-                # v7: Only rebuild VBO when POI data changed or zoom changed meaningfully
-                poi_vbo_key = (len(self._poi_cache), int(self._zoom * 4))
-                if self._poi_2d_dirty or poi_vbo_key != getattr(self, '_poi_vbo_key_v7', None):
-                    poi_2d_verts = _build_poi_markers_2d(self._poi_cache, self._zoom)
+                # Always rebuild POI VBO: coordinates are absolute world-pixels
+                # which change with zoom.  80 POIs x 6 verts = 480 verts — trivial.
+                if self._poi_cache:
+                    poi_2d_verts = _build_poi_markers_2d(self._poi_cache, self._zoom, cam_wx=self._cx)
                     for attr_2d in ('_poi_2d_vbo', '_poi_2d_vao'):
                         o_2d = getattr(self, attr_2d)
                         if o_2d:
@@ -7546,11 +7572,10 @@ class MapboxWidget(QWidget):
                         self._poi_2d_vbo = None; self._poi_2d_vao = None
                         self._poi_2d_count = 0
                     self._poi_2d_dirty = False
-                    self._poi_vbo_key_v7 = poi_vbo_key
 
                 if self._poi_2d_vao and self._poi_2d_count > 0:
                     self._ctx.enable(moderngl.BLEND)
-                    self._ctx.blend_func = (moderngl.SRC_ALPHA, moderngl.ONE_MINUS_SRC_ALPHA)
+                    self._ctx.blend_func = (moderngl.SRC_ALPHA, moderngl.ONE_MINUS_SRC_ALPHA, moderngl.ONE, moderngl.ONE_MINUS_SRC_ALPHA)
                     self._prog_poi_2d['view_proj'].write(VP_gl.tobytes())
                     poi_rad = max(5.0, 8.0 * (2.0 ** (self._zoom - 15)))
                     self._prog_poi_2d['point_radius'].value = float(poi_rad)
@@ -7574,14 +7599,15 @@ class MapboxWidget(QWidget):
             raw = self._fbo.color_attachments[0].read()
             arr = np.frombuffer(raw, dtype=np.uint8).reshape((h, w, 4))
             flipped = np.ascontiguousarray(arr[::-1])
-            self._cached_frame = QImage(flipped.data, w, h, w*4, QImage.Format_RGBA8888).copy()
+            self._cached_frame = QImage(flipped.data, w, h, w*4, QImage.Format_RGBA8888_Premultiplied).copy()
             self._gl_dirty = False
 
         # --- Blit cached frame + overlays ---
         painter = QPainter(self)
-        painter.setCompositionMode(QPainter.CompositionMode_SourceOver)
         if self._cached_frame and not self._cached_frame.isNull():
+            painter.setCompositionMode(QPainter.CompositionMode_Source)
             painter.drawImage(0, 0, self._cached_frame)
+        painter.setCompositionMode(QPainter.CompositionMode_SourceOver)
 
         # Labels (only when tiles visible and labels enabled)
         if self._tiles_visible and self._labels_visible:
@@ -7785,7 +7811,7 @@ class MapboxWidget(QWidget):
                 if bld_style:
                     fc = bld_style["fill"]
                     br, bg_, bb = fc.red()/255.0, fc.green()/255.0, fc.blue()/255.0
-                    ba = min(0.95, fc.alpha()/255.0)
+                    ba = 1.0  # 3D buildings are always fully opaque
                     wall_color = (br*0.85, bg_*0.85, bb*0.88, ba)
                     roof_color = (min(1.0, br*1.25+0.08), min(1.0, bg_*1.25+0.08),
                                   min(1.0, bb*1.20+0.06), ba)
@@ -7996,7 +8022,7 @@ class MapboxWidget(QWidget):
         # 2b. Water (animated surface, rendered after ground with blending)
         if self._tiles_visible and self._fp_water_vao and self._fp_water_count > 0:
             self._ctx.enable(moderngl.BLEND)
-            self._ctx.blend_func = (moderngl.SRC_ALPHA, moderngl.ONE_MINUS_SRC_ALPHA)
+            self._ctx.blend_func = (moderngl.SRC_ALPHA, moderngl.ONE_MINUS_SRC_ALPHA, moderngl.ONE, moderngl.ONE_MINUS_SRC_ALPHA)
             self._fp_prog_water['u_view'].write(view_gl.tobytes())
             self._fp_prog_water['u_proj'].write(proj_gl.tobytes())
             self._fp_prog_water['u_cam_pos'].write(cam_pos_gl.tobytes())
@@ -8024,7 +8050,7 @@ class MapboxWidget(QWidget):
         # 3b. v7: Route path (rendered above roads, uses road shader)
         if self._fp_route_vao and self._fp_route_count > 0:
             self._ctx.enable(moderngl.BLEND)
-            self._ctx.blend_func = (moderngl.SRC_ALPHA, moderngl.ONE_MINUS_SRC_ALPHA)
+            self._ctx.blend_func = (moderngl.SRC_ALPHA, moderngl.ONE_MINUS_SRC_ALPHA, moderngl.ONE, moderngl.ONE_MINUS_SRC_ALPHA)
             self._fp_prog_road_nav['u_view'].write(view_gl.tobytes())
             self._fp_prog_road_nav['u_proj'].write(proj_gl.tobytes())
             self._fp_prog_road_nav['u_cam_pos'].write(cam_pos_gl.tobytes())
@@ -8064,7 +8090,7 @@ class MapboxWidget(QWidget):
             bld_opacity = float(self._get_panel_val("bld_opacity", 100.0)) / 100.0
             if bld_opacity < 0.99:
                 self._ctx.enable(moderngl.BLEND)
-                self._ctx.blend_func = (moderngl.SRC_ALPHA, moderngl.ONE_MINUS_SRC_ALPHA)
+                self._ctx.blend_func = (moderngl.SRC_ALPHA, moderngl.ONE_MINUS_SRC_ALPHA, moderngl.ONE, moderngl.ONE_MINUS_SRC_ALPHA)
             self._fp_bldg_vao.render(moderngl.TRIANGLES)
             if bld_opacity < 0.99:
                 self._ctx.disable(moderngl.BLEND)
@@ -8072,7 +8098,7 @@ class MapboxWidget(QWidget):
         # 4b. v7: Trees (reuse building shader — same vertex layout, same lighting)
         if self._trees_enabled and self._fp_tree_vao and self._fp_tree_count > 0:
             self._ctx.enable(moderngl.BLEND)
-            self._ctx.blend_func = (moderngl.SRC_ALPHA, moderngl.ONE_MINUS_SRC_ALPHA)
+            self._ctx.blend_func = (moderngl.SRC_ALPHA, moderngl.ONE_MINUS_SRC_ALPHA, moderngl.ONE, moderngl.ONE_MINUS_SRC_ALPHA)
             self._fp_prog_bldg['u_view'].write(view_gl.tobytes())
             self._fp_prog_bldg['u_proj'].write(proj_gl.tobytes())
             self._fp_prog_bldg['u_cam_pos'].write(cam_pos_gl.tobytes())
@@ -8140,7 +8166,7 @@ class MapboxWidget(QWidget):
                 self._poi_cache = _extract_pois_from_tiles(mvt_snap, vis_keys, tile_px, z)
                 # Build billboard geometry
                 poi_verts, self._poi_visible_list = _build_poi_billboards_fp(
-                    self._poi_cache, cam_wx, cam_wy, mpp)
+                    self._poi_cache, cam_wx, cam_wy, mpp, z)
                 for attr in ('_fp_poi_vbo', '_fp_poi_vao'):
                     o = getattr(self, attr)
                     if o:
@@ -8160,7 +8186,7 @@ class MapboxWidget(QWidget):
 
             if self._fp_poi_vao and self._fp_poi_count > 0:
                 self._ctx.enable(moderngl.BLEND)
-                self._ctx.blend_func = (moderngl.SRC_ALPHA, moderngl.ONE_MINUS_SRC_ALPHA)
+                self._ctx.blend_func = (moderngl.SRC_ALPHA, moderngl.ONE_MINUS_SRC_ALPHA, moderngl.ONE, moderngl.ONE_MINUS_SRC_ALPHA)
 
                 self._fp_prog_poi['u_view'].write(view_gl.tobytes())
                 self._fp_prog_poi['u_proj'].write(proj_gl.tobytes())
@@ -8178,13 +8204,14 @@ class MapboxWidget(QWidget):
         raw = self._fbo.color_attachments[0].read()
         arr = np.frombuffer(raw, dtype=np.uint8).reshape((h, w, 4))
         flipped = np.ascontiguousarray(arr[::-1])
-        self._cached_frame = QImage(flipped.data, w, h, w*4, QImage.Format_RGBA8888).copy()
+        self._cached_frame = QImage(flipped.data, w, h, w*4, QImage.Format_RGBA8888_Premultiplied).copy()
 
         # --- QPainter overlay ---
         painter = QPainter(self)
-        painter.setCompositionMode(QPainter.CompositionMode_SourceOver)
         if self._cached_frame and not self._cached_frame.isNull():
+            painter.setCompositionMode(QPainter.CompositionMode_Source)
             painter.drawImage(0, 0, self._cached_frame)
+        painter.setCompositionMode(QPainter.CompositionMode_SourceOver)
 
         self._paint_immersive_hud(painter, w, h, lat, lon)
 
@@ -8413,7 +8440,7 @@ class MapboxWidget(QWidget):
 
             poi_with_dist = []
             for poi in self._poi_visible_list:
-                dx = poi["wx"] - cam_wx_d
+                dx = _snap_wx(poi["wx"], cam_wx_d, z_d) - cam_wx_d
                 dy = poi["wy"] - cam_wy_d
                 dist_m = math.hypot(dx, dy) * mpp_d
                 poi_with_dist.append((dist_m, poi))
@@ -8492,7 +8519,8 @@ class MapboxWidget(QWidget):
             for poi in self._poi_visible_list:
                 if label_count >= 20:
                     break
-                dx_l = poi["wx"] - cam_wx_l
+                snapped_wx = _snap_wx(poi["wx"], cam_wx_l, z_l)
+                dx_l = snapped_wx - cam_wx_l
                 dy_l = poi["wy"] - cam_wy_l
                 dist_l = math.hypot(dx_l, dy_l)
                 dist_m_l = dist_l * mpp_l
@@ -8505,12 +8533,12 @@ class MapboxWidget(QWidget):
                 # Get terrain elevation
                 elev_z = 0.0
                 if terrain_ok:
-                    elev_m = _sample_terrain_bilinear(self._terrain_cache, poi["wx"], poi["wy"], z_l)
+                    elev_m = _sample_terrain_bilinear(self._terrain_cache, snapped_wx, poi["wy"], z_l)
                     elev_z = elev_m / max(mpp_l, 0.001)
                 # Label floats above the halo cylinder (~12m above ground)
                 label_z = elev_z + 12.0 / max(mpp_l, 0.001)
                 # Project to screen
-                pdx = poi["wx"] - proj_cx
+                pdx = snapped_wx - proj_cx
                 pdy = poi["wy"] - proj_cy
                 rel_x = -(pdx)
                 rel_y = label_z - eye_h
@@ -8705,7 +8733,31 @@ class MapboxWidget(QWidget):
     def _draw_labels_overlay(self, painter, all_label_data, w, h, tile_px):
         if not all_label_data or not self._labels_visible: return
 
+        bearing_rad = math.radians(self._bearing)
+        pitch_rad = math.radians(self._pitch)
+        cos_b = math.cos(bearing_rad); sin_b = math.sin(bearing_rad)
+
+        # Compute screen-space offset from cached label image's camera origin
+        # to current camera position.  This lets us reuse the cached QImage
+        # and just shift it, keeping labels locked to the tiles during pans.
+        def _cam_delta_px():
+            """Return (dx_screen, dy_screen) shift to apply to a cached
+            label image that was rendered at (_label_overlay_cx, _label_overlay_cy)."""
+            ocx = getattr(self, '_label_overlay_cx', self._cx)
+            ocy = getattr(self, '_label_overlay_cy', self._cy)
+            dwx = self._cx - ocx
+            dwy = self._cy - ocy
+            # Rotate world delta into screen space (same transform as label placement)
+            sdx = dwx * cos_b + dwy * sin_b
+            sdy = -dwx * sin_b + dwy * cos_b
+            if self._pitch > 0.5:
+                cos_p = math.cos(pitch_rad)
+                fov_f = 1.0 - 0.6 * math.sin(pitch_rad)
+                sdy = sdy * (cos_p * fov_f + (1.0 - cos_p) * 0.6)
+            return -sdx, -sdy
+
         # Hotfix: while interacting, just reuse the cached label image
+        # but SHIFTED to follow the camera so labels track tiles.
         if (self._drag_start is not None or
             self._rdrag_start is not None or
             self._mdrag_start is not None or
@@ -8713,7 +8765,8 @@ class MapboxWidget(QWidget):
             self._scroll_zoom_active or
             self._zoom_velocity > 0.03):
             if getattr(self, "_label_overlay_img", None) is not None:
-                painter.drawImage(0, 0, self._label_overlay_img)
+                dx, dy = _cam_delta_px()
+                painter.drawImage(int(dx), int(dy), self._label_overlay_img)
             return
 
         # v7: Cache labels to a QImage — only rebuild when view changes meaningfully
@@ -8725,12 +8778,10 @@ class MapboxWidget(QWidget):
                      round(self._cx / 100), round(self._cy / 100))
         if (hasattr(self, '_label_overlay_key') and self._label_overlay_key == label_key
                 and hasattr(self, '_label_overlay_img') and self._label_overlay_img is not None):
-            painter.drawImage(0, 0, self._label_overlay_img)
+            dx, dy = _cam_delta_px()
+            painter.drawImage(int(dx), int(dy), self._label_overlay_img)
             return
 
-        bearing_rad = math.radians(self._bearing)
-        pitch_rad = math.radians(self._pitch)
-        cos_b = math.cos(bearing_rad); sin_b = math.sin(bearing_rad)
         cos_p = math.cos(pitch_rad) if self._pitch > 0.5 else 1.0
         fov_f = (1.0 - 0.6 * math.sin(pitch_rad)) if self._pitch > 0.5 else 1.0
 
@@ -8753,6 +8804,8 @@ class MapboxWidget(QWidget):
         if not candidates:
             self._label_overlay_key = label_key
             self._label_overlay_img = None
+            self._label_overlay_cx = self._cx
+            self._label_overlay_cy = self._cy
             return
         candidates.sort(key=lambda c: c[0])
 
@@ -8807,6 +8860,8 @@ class MapboxWidget(QWidget):
 
         self._label_overlay_key = label_key
         self._label_overlay_img = label_img
+        self._label_overlay_cx = self._cx
+        self._label_overlay_cy = self._cy
         painter.drawImage(0, 0, label_img)
 
     def _draw_poi_labels_2d(self, painter, w, h):
@@ -8832,7 +8887,8 @@ class MapboxWidget(QWidget):
         for poi in self._poi_cache:
             if placed >= max_labels:
                 break
-            wx, wy = poi["wx"], poi["wy"]
+            wx = _snap_wx(poi["wx"], self._cx, z)
+            wy = poi["wy"]
             dx = wx - self._cx; dy = wy - self._cy
             sx_s = dx * cos_b + dy * sin_b
             sy_s = -dx * sin_b + dy * cos_b
