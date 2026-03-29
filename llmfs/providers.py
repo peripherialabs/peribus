@@ -554,6 +554,51 @@ class OllamaProvider(LLMProvider):
                 yield chunk.choices[0].delta.content
 
 
+class FireworksProvider(LLMProvider):
+    """Fireworks AI provider using OpenAI-compatible API"""
+    
+    def __init__(self, api_key: str = None):
+        self.api_key = api_key or os.getenv("FIREWORKS_API_KEY")
+        if not self.api_key:
+            raise ValueError("FIREWORKS_API_KEY not found")
+        
+        from openai import AsyncOpenAI
+        # Fireworks AI is fully OpenAI-compatible
+        self.client = AsyncOpenAI(
+            api_key=self.api_key,
+            base_url="https://api.fireworks.ai/inference/v1"
+        )
+    
+    @property
+    def name(self) -> str:
+        return "fireworks"
+    
+    def get_models(self) -> List[str]:
+        return [
+            "accounts/fireworks/models/kimi-k2p5",
+            "accounts/fireworks/models/glm-5",
+            "accounts/fireworks/models/minimax-m2p5",
+            "accounts/fireworks/models/nvidia-nemotron-3-super-120b-a12b-fp8",
+            "accounts/fireworks/models/firefunction-v2",
+        ]
+    
+    async def stream_response(self, config: ProviderConfig) -> AsyncIterator[str]:
+        messages = _build_openai_messages(config)
+        
+        stream = await self.client.chat.completions.create(
+            model=config.model,
+            messages=messages,
+            stream=True,
+            max_tokens=config.max_tokens,
+            temperature=config.temperature,
+        )
+        
+        async for chunk in stream:
+            if chunk.choices and chunk.choices[0].delta.content:
+                yield chunk.choices[0].delta.content
+
+
+# Provider registry
 # Provider registry
 _PROVIDERS = {
     "claude": ClaudeProvider,
@@ -564,6 +609,7 @@ _PROVIDERS = {
     "cerebras": CerebrasProvider,
     "moonshot": MoonShotAIProvider,
     "ollama": OllamaProvider,
+    "fireworks": FireworksProvider,
 }
 
 _provider_instances: Dict[str, LLMProvider] = {}
