@@ -71,7 +71,7 @@ from PySide6.QtWidgets import (
     QWidget, QTextEdit, QVBoxLayout, QHBoxLayout, QFrame,
     QSizePolicy, QApplication, QScrollArea, QGraphicsDropShadowEffect, QSplitter
 )
-from PySide6.QtCore import Qt, Signal, QTimer, QPoint, QPointF, QRectF, QThread, QObject, Slot
+from PySide6.QtCore import Qt, Signal, QTimer, QPoint, QPointF, QRectF, QThread, QObject, Slot, QVariantAnimation, QEasingCurve
 from PySide6.QtGui import QColor, QPalette, QFont, QTextCursor, QKeyEvent, QTextCharFormat
 import asyncio
 import errno
@@ -617,7 +617,6 @@ class Plan9MenuFilter(QObject):
 
     def eventFilter(self, obj, event):
         from PySide6.QtGui import QMouseEvent
-
         if event.type() == QMouseEvent.Type.MouseButtonPress and event.button() == Qt.RightButton:
             # Find the QTextEdit that owns this viewport
             text_edit = obj.parent()
@@ -1032,6 +1031,7 @@ class TerminalWidget(QWidget):
 
         self._init_ui()
         self._setup_shell_process()
+        self.installEventFilter(self)
 
     # ------------------------------------------------------------------
     # UI setup
@@ -1039,6 +1039,7 @@ class TerminalWidget(QWidget):
 
     def _init_ui(self):
         self.setWindowFlags(Qt.Widget)
+        self.setFocusPolicy(Qt.StrongFocus)
         # Ensure fully transparent — critical when embedded in a
         # QGraphicsProxyWidget which otherwise paints an opaque bg
         self.setAttribute(Qt.WA_TranslucentBackground, True)
@@ -1052,7 +1053,7 @@ class TerminalWidget(QWidget):
 
         self.setup_terminal_frame()
         main_layout.addWidget(self.terminal_frame)
-        self.setMinimumSize(200, 150)
+        #self.setMinimumSize(10, 10)
 
     def setup_terminal_frame(self):
         self.terminal_frame = QFrame()
@@ -1204,7 +1205,10 @@ class TerminalWidget(QWidget):
         te.setMinimumHeight(20)
         te.document().contentsChanged.connect(lambda: self._adjust_height(te))
         # Install Plan 9 mouse menu handler
+        te.installEventFilter(self)
+        te.setFocusPolicy(Qt.StrongFocus)
         te.viewport().installEventFilter(self._plan9_menu_filter)
+
         # Forward wheel events from text display to the outer scroll area
         te.wheelEvent = lambda event, _te=te: self._forward_wheel_event(event)
         return te
@@ -1281,8 +1285,12 @@ class TerminalWidget(QWidget):
         self._input_bg_g = 255
         self._input_bg_b = 255
         self._input_bg_alpha = 0          # current animated alpha
-        self._input_bg_target_alpha = 150  # alpha when focused
+        self._input_bg_target_alpha = 230 #150  # alpha when focused
         self._input_focus_anim = None      # QTimer for animation
+
+        # Frame focus animation state — mirrors input, animates terminal_frame bg alpha
+        self._frame_focus_alpha = 0       # current animated alpha
+        self._frame_focus_anim = None     # QTimer for animation
 
         self._apply_input_style()
         self.command_input.setPlaceholderText("Enter command or prompt...")
@@ -1295,7 +1303,7 @@ class TerminalWidget(QWidget):
         dark = getattr(self, '_is_dark_mode', False)
         text_color = "rgba(230, 230, 230, 255)" if dark else "rgba(0, 0, 0, 255)"
         r, g, b = self._input_bg_r, self._input_bg_g, self._input_bg_b
-        a = self._input_bg_alpha
+        a = 0 #self._input_bg_alpha
         self.command_input.setStyleSheet(f"""
             QTextEdit {{
                 background-color: rgba({r}, {g}, {b}, {a});
@@ -1338,7 +1346,7 @@ class TerminalWidget(QWidget):
 
         self._input_focus_anim = QTimer(self)
         self._input_focus_anim.timeout.connect(tick)
-        self._input_focus_anim.start(16)
+        self._input_focus_anim.start(0)
 
     def _set_input_bg_target(self, r, g, b, target_alpha):
         """Update the input background color targets (called by mode/theme changes)."""
@@ -1346,13 +1354,70 @@ class TerminalWidget(QWidget):
         self._input_bg_g = g
         self._input_bg_b = b
         self._input_bg_target_alpha = target_alpha
-        # If not focused, keep alpha at 0; if focused, snap to new target
+        # If not focused, keep alpha at 0; if focused, snap to new target.
+        # Apply the same logic to the frame so they stay in sync.
         if self.command_input.hasFocus():
             self._input_bg_alpha = target_alpha
+            self._frame_focus_alpha = target_alpha
         else:
             self._input_bg_alpha = 0
+            self._frame_focus_alpha = 0
         self._apply_input_style()
+        self._apply_frame_focus_style()
 
+    # ------------------------------------------------------------------
+    # Whole-terminal frame focus animation (same bg color/alpha as input)
+    # ------------------------------------------------------------------
+
+    def _apply_frame_focus_style(self):
+        """Apply terminal_frame background using current _frame_focus_alpha.
+
+        Uses the exact same RGB as the command input so both surfaces
+        fade in/out to the same colour on focus — in both light and dark mode.
+        """
+        r, g, b = self._input_bg_r, self._input_bg_g, self._input_bg_b
+        a = self._frame_focus_alpha
+        dark = getattr(self, '_is_dark_mode', False)
+        if dark:
+            border_css = "border: 2px solid rgba(200, 200, 200, 220);"
+        else:
+            border_css = "border: 2px solid rgba(150, 150, 150, 200);"
+        self.terminal_frame.setStyleSheet(f"""
+            QFrame {{
+                background-color: rgba({r}, {g}, {b}, {a});
+                {border_css}
+                border-radius: 5px;
+            }}
+        """)
+
+    def _animate_frame_focus(self, focus_in: bool):
+            """Animate terminal_frame background alpha using Qt's Animation Framework."""
+            
+            # 1. Stop any existing animation safely
+            if hasattr(self, '_frame_focus_anim') and self._frame_focus_anim:
+                self._frame_focus_anim.stop()
+                self._frame_focus_anim.deleteLater()
+                self._frame_focus_anim = None
+
+            # 2. Create the new animation
+            self._frame_focus_anim = QVariantAnimation(self)
+            self._frame_focus_anim.setDuration(200)
+            self._frame_focus_anim.setEasingCurve(QEasingCurve.InOutQuad)
+            
+            # 3. Set Start/End (Increased alpha to 220 as requested)
+            target_alpha = 220 if focus_in else 0
+            self._frame_focus_anim.setStartValue(self._frame_focus_alpha)
+            self._frame_focus_anim.setEndValue(target_alpha)
+            
+            # 4. Connect signals
+            def update_alpha(value):
+                self._frame_focus_alpha = value
+                self._apply_frame_focus_style()
+                
+            self._frame_focus_anim.valueChanged.connect(update_alpha)
+            
+            # 5. Start WITHOUT DeleteWhenStopped to avoid the race condition crash
+            self._frame_focus_anim.start()
     # ------------------------------------------------------------------
     # Lifecycle
     # ------------------------------------------------------------------
@@ -1435,12 +1500,16 @@ class TerminalWidget(QWidget):
     # ------------------------------------------------------------------
 
     def eventFilter(self, obj, event):
+
+        if not hasattr(self, 'command_input') or self.command_input is None:
+            return super().eventFilter(obj, event)
+        if event.type() == event.Type.FocusIn:
+            self._animate_frame_focus(True)
+        elif event.type() == event.Type.FocusOut:
+            self._animate_frame_focus(False)
+
         if obj is self.command_input:
-            if event.type() == event.Type.FocusIn:
-                self._animate_input_focus(True)
-            elif event.type() == event.Type.FocusOut:
-                self._animate_input_focus(False)
-            elif event.type() == QKeyEvent.Type.KeyPress:
+            if event.type() == QKeyEvent.Type.KeyPress:
                 # --- Global shortcuts (Ctrl+key) ---
                 if event.modifiers() == Qt.ControlModifier:
                     if event.key() == Qt.Key_E:
@@ -1836,7 +1905,7 @@ class TerminalWidget(QWidget):
                 placeholder = f"[{self.connected_agent}] " if self.connected_agent else "Enter command..."
                 self.command_input.setPlaceholderText(placeholder)
                 
-            self._update_input_style()
+            #self._update_input_style()
             self.animate_shadow_color(self.terminal_mode)
             return
 
@@ -4208,10 +4277,14 @@ Keys:
         self.append_text(f"Color scheme: {scheme_name}\n", self._active_shell_echo_color)
 
     def _set_shadow_to_scheme(self):
-        """Immediately set shadow to match the active color scheme."""
+        """
+        Immediately set shadow to match the active color scheme.
+        Uses QVariantAnimation for a smooth, hardware-independent transition.
+        """
         shadow_target = self._proxy if self._proxy is not None else self
         current_effect = shadow_target.graphicsEffect()
 
+        # If there's no shadow effect to animate, just exit
         if not isinstance(current_effect, QGraphicsDropShadowEffect):
             return
 
@@ -4219,36 +4292,35 @@ Keys:
         target_color = self._parse_rgba(self._active_shadow_color)
         start_color = shadow.color()
 
-        steps = 30
-        step = [0]
+        # 1. Clean up any existing shadow color animation to prevent race conditions
+        if hasattr(self, '_shadow_scheme_anim') and self._shadow_scheme_anim:
+            self._shadow_scheme_anim.stop()
+            self._shadow_scheme_anim.deleteLater()
+            self._shadow_scheme_anim = None
 
-        if hasattr(self, '_shadow_color_timer'):
-            self._shadow_color_timer.stop()
-            self._shadow_color_timer.deleteLater()
+        # 2. Initialize the QVariantAnimation
+        # 30 steps * 16ms is roughly 480ms
+        anim = QVariantAnimation(self)
+        anim.setDuration(480) 
+        anim.setStartValue(0.0)
+        anim.setEndValue(1.0)
+        anim.setEasingCurve(QEasingCurve.InOutQuad)
 
-        def lerp(a, b, t):
-            return int(a + (b - a) * t)
+        def update_shadow_color(t):
+            # Manually interpolate the RGBA channels
+            r = int(start_color.red() + (target_color.red() - start_color.red()) * t)
+            g = int(start_color.green() + (target_color.green() - start_color.green()) * t)
+            b = int(start_color.blue() + (target_color.blue() - start_color.blue()) * t)
+            a = int(start_color.alpha() + (target_color.alpha() - start_color.alpha()) * t)
+            
+            shadow.setColor(QColor(r, g, b, a))
 
-        def tick():
-            if step[0] <= steps:
-                t = step[0] / steps
-                t = t * t * (3.0 - 2.0 * t)
-                r = lerp(start_color.red(), target_color.red(), t)
-                g = lerp(start_color.green(), target_color.green(), t)
-                b = lerp(start_color.blue(), target_color.blue(), t)
-                a = lerp(start_color.alpha(), target_color.alpha(), t)
-                shadow.setColor(QColor(r, g, b, a))
-                step[0] += 1
-            else:
-                shadow.setColor(target_color)
-                if hasattr(self, '_shadow_color_timer'):
-                    self._shadow_color_timer.stop()
-                    self._shadow_color_timer.deleteLater()
-                    delattr(self, '_shadow_color_timer')
+        anim.valueChanged.connect(update_shadow_color)
 
-        self._shadow_color_timer = QTimer(self)
-        self._shadow_color_timer.timeout.connect(tick)
-        self._shadow_color_timer.start(16)
+        # 3. Store reference and start
+        # Storing the reference is key to preventing the "Use-After-Free" crash
+        self._shadow_scheme_anim = anim
+        anim.start()
 
     def _open_color_picker(self):
         """Open the color scheme picker dialog."""
@@ -4693,129 +4765,112 @@ Keys:
     # ------------------------------------------------------------------
 
     def animate_shadow_to_position(self):
-        # When embedded in a QGraphicsProxyWidget, the shadow MUST be
-        # applied on the proxy — QGraphicsEffect on an embedded widget
-        # causes it to vanish.  When standalone (no proxy), apply on self.
+        """
+        Animate shadow offset from (0,0) to (30,30) on widget appearance.
+        Uses QVariantAnimation with OutCubic easing for a smooth 'pop' effect.
+        """
+        # 1. Determine target (Proxy for embedded, self for standalone)
         shadow_target = self._proxy if self._proxy is not None else self
 
-        # Shadow color depends on dark mode
+        # 2. Determine shadow color based on dark mode
         if getattr(self, '_is_dark_mode', False):
             shadow_color = QColor(255, 255, 255, 160)
         else:
             shadow_color = QColor(0, 0, 0, 120)
 
+        # 3. Create/Configure the shadow effect
         shadow = QGraphicsDropShadowEffect(self)
         shadow.setBlurRadius(25)
         shadow.setColor(shadow_color)
         shadow.setOffset(0, 0)
         shadow_target.setGraphicsEffect(shadow)
-        self.update()
-        self.repaint()
-        #QApplication.processEvents()
 
-        steps = 30
-        step = [0]
-        target = 30
+        # 4. Cleanup existing animation
+        if hasattr(self, '_shadow_pos_anim') and self._shadow_pos_anim:
+            self._shadow_pos_anim.stop()
+            self._shadow_pos_anim.deleteLater()
+            self._shadow_pos_anim = None
 
-        def tick():
-            if step[0] <= steps:
-                p = 1 - pow(1 - step[0] / steps, 3)
-                shadow.setOffset(QPointF(target * p, target * p))
-                self.update()
-                self.repaint()
-                if self.parent():
-                    self.parent().update()
-                #QApplication.processEvents()
-                step[0] += 1
-            else:
-                self.update()
-                self.repaint()
-                if self.parent():
-                    self.parent().update()
-                #QApplication.processEvents()
-                if hasattr(self, '_shadow_timer'):
-                    self._shadow_timer.stop()
-                    self._shadow_timer.deleteLater()
-                    delattr(self, '_shadow_timer')
+        # 5. Initialize Animation
+        # We animate a QPointF directly from (0,0) to (30,30)
+        anim = QVariantAnimation(self)
+        anim.setDuration(480) # ~30 steps * 16ms
+        anim.setStartValue(QPointF(0, 0))
+        anim.setEndValue(QPointF(30, 30))
+        anim.setEasingCurve(QEasingCurve.OutCubic) # Matches your manual 'pow' formula
 
-        self._shadow_timer = QTimer(self)
-        self._shadow_timer.timeout.connect(tick)
-        self._shadow_timer.start(16)
+        def update_shadow_pos(pos):
+            shadow.setOffset(pos)
+            # Trigger updates to ensure the scene repaints the shadow area
+            self.update()
+            if self.parent():
+                self.parent().update()
+
+        anim.valueChanged.connect(update_shadow_pos)
+
+        # 6. Store reference and start
+        self._shadow_pos_anim = anim
+        anim.start()
 
     def animate_shadow_color(self, entering_terminal: bool):
-        """
-        Animate shadow color between base and active scheme shadow color.
-        
-        entering_terminal=True:  base → scheme shadow color
-        entering_terminal=False: scheme shadow color → base
-        
-        The base color respects dark mode: white in dark, black in light.
-        """
-        shadow_target = self._proxy if self._proxy is not None else self
+            """
+            Animate shadow color and blur between base and active scheme shadow color.
+            Uses QVariantAnimation to ensure smooth timing regardless of frame rate.
+            """
+            shadow_target = self._proxy if self._proxy is not None else self
 
-        # Grab existing shadow or create one
-        current_effect = shadow_target.graphicsEffect()
-        if not isinstance(current_effect, QGraphicsDropShadowEffect):
-            shadow = QGraphicsDropShadowEffect(self)
-            shadow.setBlurRadius(25)
-            shadow.setOffset(QPointF(30, 30))
-            shadow_target.setGraphicsEffect(shadow)
-        else:
-            shadow = current_effect
+            # 1. Grab or create the shadow effect
+            shadow = shadow_target.graphicsEffect()
+            if not isinstance(shadow, QGraphicsDropShadowEffect):
+                shadow = QGraphicsDropShadowEffect(self)
+                shadow.setBlurRadius(25)
+                shadow.setOffset(QPointF(30, 30))
+                shadow_target.setGraphicsEffect(shadow)
 
-        # Base color depends on dark mode
-        if getattr(self, '_is_dark_mode', False):
-            base_color = QColor(255, 255, 255, 160)
-        else:
-            base_color = QColor(0, 0, 0, 120)
+            # 2. Setup color targets
+            if getattr(self, '_is_dark_mode', False):
+                base_color = QColor(255, 255, 255, 160)
+            else:
+                base_color = QColor(0, 0, 0, 120)
 
-        scheme_color = self._parse_rgba(self._active_shadow_color)
+            scheme_color = self._parse_rgba(self._active_shadow_color)
+            
+            start_color = base_color if entering_terminal else scheme_color
+            end_color = scheme_color if entering_terminal else base_color
 
-        start_color = base_color if entering_terminal else scheme_color
-        end_color = scheme_color if entering_terminal else base_color
+            # 3. Setup blur targets
+            start_blur = 25.0 if entering_terminal else 45.0
+            end_blur = 45.0 if entering_terminal else 25.0
 
-        # Also animate blur radius for extra punch
-        start_blur = 25.0 if entering_terminal else 45.0
-        end_blur = 45.0 if entering_terminal else 25.0
+            # 4. Clean up any existing shadow animation
+            if hasattr(self, '_shadow_color_anim') and self._shadow_color_anim:
+                self._shadow_color_anim.stop()
+                self._shadow_color_anim.deleteLater()
 
-        steps = 35
-        step = [0]
+            # 5. Initialize the animation (0.0 to 1.0 progress)
+            anim = QVariantAnimation(self)
+            anim.setDuration(350)  # Roughly equivalent to 35 steps @ 10ms
+            anim.setStartValue(0.0)
+            anim.setEndValue(1.0)
+            anim.setEasingCurve(QEasingCurve.InOutCubic)
 
-        # Kill any existing color animation timer
-        if hasattr(self, '_shadow_color_timer'):
-            self._shadow_color_timer.stop()
-            self._shadow_color_timer.deleteLater()
-
-        def lerp(a, b, t):
-            return int(a + (b - a) * t)
-
-        def tick():
-            if step[0] <= steps:
-                # Ease-in-out cubic
-                t = step[0] / steps
-                t = t * t * (3.0 - 2.0 * t)
-
-                r = lerp(start_color.red(), end_color.red(), t)
-                g = lerp(start_color.green(), end_color.green(), t)
-                b = lerp(start_color.blue(), end_color.blue(), t)
-                a = lerp(start_color.alpha(), end_color.alpha(), t)
+            def update_shadow(t):
+                # Manually interpolate color channels
+                r = int(start_color.red() + (end_color.red() - start_color.red()) * t)
+                g = int(start_color.green() + (end_color.green() - start_color.green()) * t)
+                b = int(start_color.blue() + (end_color.blue() - start_color.blue()) * t)
+                a = int(start_color.alpha() + (end_color.alpha() - start_color.alpha()) * t)
                 shadow.setColor(QColor(r, g, b, a))
 
+                # Interpolate blur
                 blur = start_blur + (end_blur - start_blur) * t
                 shadow.setBlurRadius(blur)
 
-                step[0] += 1
-            else:
-                shadow.setColor(end_color)
-                shadow.setBlurRadius(end_blur)
-                if hasattr(self, '_shadow_color_timer'):
-                    self._shadow_color_timer.stop()
-                    self._shadow_color_timer.deleteLater()
-                    delattr(self, '_shadow_color_timer')
-
-        self._shadow_color_timer = QTimer(self)
-        self._shadow_color_timer.timeout.connect(tick)
-        self._shadow_color_timer.start(16)
+            anim.valueChanged.connect(update_shadow)
+            
+            # Store reference and start
+            self._shadow_color_anim = anim
+            anim.start()
 
     # ------------------------------------------------------------------
     # Dark mode support (called from RioWindow.toggle_dark_mode)
@@ -4905,110 +4960,91 @@ Keys:
         )
 
     def _animate_frame_dark_mode(self, target_border: str, steps: int):
-        """Animate terminal_frame border color for dark/light mode."""
+        """Animate terminal_frame border color for dark/light mode using QVariantAnimation."""
         import re as _re
 
-        if hasattr(self, '_dm_frame_timer'):
-            self._dm_frame_timer.stop()
-            self._dm_frame_timer.deleteLater()
+        # 1. Clean up existing animation to prevent collisions/crashes
+        if hasattr(self, '_dm_frame_anim') and self._dm_frame_anim:
+            self._dm_frame_anim.stop()
+            self._dm_frame_anim.deleteLater()
+            self._dm_frame_anim = None
 
-        # Parse current border from stylesheet
+        # 2. Parse current state from stylesheet
         current_style = self.terminal_frame.styleSheet()
+        
+        # Current Border
         m = _re.search(
             r'border:\s*\d+px\s+solid\s+rgba\(\s*(\d+)\s*,\s*(\d+)\s*,\s*(\d+)\s*,\s*(\d+)',
             current_style
         )
-        if m:
-            sr, sg, sb, sa = int(m.group(1)), int(m.group(2)), int(m.group(3)), int(m.group(4))
-        else:
-            sr, sg, sb, sa = 150, 150, 150, 200
+        sr, sg, sb, sa = (int(m.group(i)) for i in range(1, 5)) if m else (150, 150, 150, 200)
 
-        # Parse current bg alpha
+        # Current Background (must remain static during this specific animation)
         m2 = _re.search(
             r'background-color:\s*rgba\(\s*(\d+)\s*,\s*(\d+)\s*,\s*(\d+)\s*,\s*(\d+)',
             current_style
         )
-        if m2:
-            bg_r, bg_g, bg_b, bg_a = int(m2.group(1)), int(m2.group(2)), int(m2.group(3)), int(m2.group(4))
-        else:
-            bg_r, bg_g, bg_b, bg_a = 255, 255, 255, 0
+        bg_r, bg_g, bg_b, bg_a = (int(m2.group(i)) for i in range(1, 5)) if m2 else (255, 255, 255, 0)
 
-        # Parse target border
+        # 3. Parse Target
         tc = self._parse_rgba(target_border)
         tr_, tg_, tb_, ta_ = tc.red(), tc.green(), tc.blue(), tc.alpha()
 
-        step = [0]
+        # 4. Initialize Animation
+        anim = QVariantAnimation(self)
+        # Convert 'steps' to duration (assuming ~16ms per step)
+        anim.setDuration(steps * 16) 
+        anim.setStartValue(0.0)
+        anim.setEndValue(1.0)
+        anim.setEasingCurve(QEasingCurve.InOutQuad)
 
-        def tick():
-            if step[0] <= steps:
-                t = step[0] / steps
-                t = t * t * (3.0 - 2.0 * t)
-                r = int(sr + (tr_ - sr) * t)
-                g = int(sg + (tg_ - sg) * t)
-                b = int(sb + (tb_ - sb) * t)
-                a = int(sa + (ta_ - sa) * t)
-                self.terminal_frame.setStyleSheet(f"""
-                    QFrame {{
-                        background-color: rgba({bg_r}, {bg_g}, {bg_b}, {bg_a});
-                        border: 2px solid rgba({r}, {g}, {b}, {a});
-                        border-radius: 5px;
-                    }}
-                """)
-                step[0] += 1
-            else:
-                self.terminal_frame.setStyleSheet(f"""
-                    QFrame {{
-                        background-color: rgba({bg_r}, {bg_g}, {bg_b}, {bg_a});
-                        border: 2px solid rgba({tr_}, {tg_}, {tb_}, {ta_});
-                        border-radius: 5px;
-                    }}
-                """)
-                self._dm_frame_timer.stop()
-                self._dm_frame_timer.deleteLater()
-                delattr(self, '_dm_frame_timer')
+        def update_border(t):
+            # Interpolate border color
+            r = int(sr + (tr_ - sr) * t)
+            g = int(sg + (tg_ - sg) * t)
+            b = int(sb + (tb_ - sb) * t)
+            a = int(sa + (ta_ - sa) * t)
+            
+            self.terminal_frame.setStyleSheet(f"""
+                QFrame {{
+                    background-color: rgba({bg_r}, {bg_g}, {bg_b}, {bg_a});
+                    border: 2px solid rgba({r}, {g}, {b}, {a});
+                    border-radius: 5px;
+                }}
+            """)
 
-        self._dm_frame_timer = QTimer(self)
-        self._dm_frame_timer.timeout.connect(tick)
-        self._dm_frame_timer.start(16)
+        anim.valueChanged.connect(update_border)
+        
+        # 5. Store reference and start
+        self._dm_frame_anim = anim
+        anim.start()
 
     def _animate_text_dark_mode(self, target_rgba: str, selection_bg: str, steps: int):
-        """Animate all text display colors for dark/light mode.
-
-        Updates both:
-          - The stylesheet (affects new text default color + selection)
-          - Existing inline character formats: any text with near-black
-            foreground gets animated to near-white (dark mode) and vice versa.
-        """
-        if hasattr(self, '_dm_text_timer'):
-            self._dm_text_timer.stop()
-            self._dm_text_timer.deleteLater()
-
+        """Animate all text display colors for dark/light mode using QVariantAnimation."""
         import re as _re
 
-        # Parse current text color from first text display stylesheet
+        # 1. Cleanup existing animation
+        if hasattr(self, '_dm_text_anim') and self._dm_text_anim:
+            self._dm_text_anim.stop()
+            self._dm_text_anim.deleteLater()
+            self._dm_text_anim = None
+
+        # 2. Parse current text color from stylesheet
         if self.text_displays:
             style = self.text_displays[0].styleSheet()
             m = _re.search(r'color:\s*rgba\(\s*(\d+)\s*,\s*(\d+)\s*,\s*(\d+)\s*,\s*(\d+)', style)
-            if m:
-                sr, sg, sb, sa = int(m.group(1)), int(m.group(2)), int(m.group(3)), int(m.group(4))
-            else:
-                sr, sg, sb, sa = 0, 0, 0, 230
+            sr, sg, sb, sa = (int(m.group(i)) for i in range(1, 5)) if m else (0, 0, 0, 230)
         else:
             sr, sg, sb, sa = 0, 0, 0, 230
 
         tc = self._parse_rgba(target_rgba)
         tr_, tg_, tb_, ta_ = tc.red(), tc.green(), tc.blue(), tc.alpha()
-
         size = getattr(self, '_font_size', 12)
-
-        # ---- Collect ranges of "default-colored" text to recolor ----
-        # Default text is near-black or near-white (low or high luminance).
-        # We skip colored text (agent output, errors, etc.) that has
-        # distinctive hue/saturation.
         entering_dark = self._is_dark_mode
 
-        # Build per-text-display list of (cursor_start, cursor_end, start_color) ranges
-        recolor_ranges = []  # list of (QTextEdit, [(start, end, QColor), ...])
+        # 3. Pre-collect ranges of "default-colored" text to recolor
+        # We do this once BEFORE the animation starts to save CPU cycles per frame
+        recolor_ranges = []
         for te in self.text_displays:
             doc = te.document()
             ranges = []
@@ -5019,97 +5055,73 @@ Keys:
                     frag = it.fragment()
                     if frag.isValid():
                         fg = frag.charFormat().foreground().color()
-                        # Determine if this is "default" colored text:
-                        # near-black (entering dark) or near-white (leaving dark)
                         lum = fg.red() * 0.299 + fg.green() * 0.587 + fg.blue() * 0.114
-                        is_default = False
-                        if entering_dark and lum < 80:
-                            is_default = True
-                        elif not entering_dark and lum > 180:
-                            is_default = True
-                        if is_default:
-                            ranges.append((
-                                frag.position(),
-                                frag.position() + frag.length(),
-                                QColor(fg)
-                            ))
+                        
+                        # Determine if this needs transition based on luminance
+                        if (entering_dark and lum < 80) or (not entering_dark and lum > 180):
+                            ranges.append({
+                                'start': frag.position(),
+                                'end': frag.position() + frag.length(),
+                                'orig_r': fg.red(),
+                                'orig_g': fg.green(),
+                                'orig_b': fg.blue(),
+                                'orig_a': fg.alpha()
+                            })
                     it += 1
                 block = block.next()
             if ranges:
                 recolor_ranges.append((te, ranges))
 
-        step = [0]
+        # 4. Setup the Animation
+        anim = QVariantAnimation(self)
+        anim.setDuration(steps * 16)
+        anim.setStartValue(0.0)
+        anim.setEndValue(1.0)
+        anim.setEasingCurve(QEasingCurve.InOutQuad)
 
-        def lerp(a, b, t):
-            return int(a + (b - a) * t)
+        def update_text_transition(t):
+            # Interpolate current color values
+            curr_r = int(sr + (tr_ - sr) * t)
+            curr_g = int(sg + (tg_ - sg) * t)
+            curr_b = int(sb + (tb_ - sb) * t)
+            curr_a = int(sa + (ta_ - sa) * t)
 
-        def tick():
-            if step[0] <= steps:
-                t = step[0] / steps
-                t = t * t * (3.0 - 2.0 * t)
-                r = int(sr + (tr_ - sr) * t)
-                g = int(sg + (tg_ - sg) * t)
-                b = int(sb + (tb_ - sb) * t)
-                a = int(sa + (ta_ - sa) * t)
+            # Update stylesheet (affects new text and selection)
+            css = f"""
+                QTextEdit {{
+                    background-color: transparent; border: none;
+                    color: rgba({curr_r}, {curr_g}, {curr_b}, {curr_a});
+                    selection-background-color: {selection_bg};
+                    font-family: 'Consolas', 'Monaco', monospace;
+                    font-size: {size}px;
+                }}
+            """
+            
+            # Update each display's stylesheet and existing text ranges
+            for te, ranges in recolor_ranges:
+                te.setStyleSheet(css)
+                cursor = te.textCursor()
+                
+                # Use a single format object to reduce allocations
+                fmt = QTextCharFormat()
+                
+                for r_data in ranges:
+                    # Lerp from the fragment's specific original color to the target
+                    r = int(r_data['orig_r'] + (tr_ - r_data['orig_r']) * t)
+                    g = int(r_data['orig_g'] + (tg_ - r_data['orig_g']) * t)
+                    b = int(r_data['orig_b'] + (tb_ - r_data['orig_b']) * t)
+                    a = int(r_data['orig_a'] + (ta_ - r_data['orig_a']) * t)
+                    
+                    fmt.setForeground(QColor(r, g, b, a))
+                    cursor.setPosition(r_data['start'])
+                    cursor.setPosition(r_data['end'], QTextCursor.KeepAnchor)
+                    cursor.mergeCharFormat(fmt)
 
-                # Update stylesheet for all text displays
-                css = f"""
-                    QTextEdit {{
-                        background-color: transparent; border: none;
-                        color: rgba({r}, {g}, {b}, {a});
-                        selection-background-color: {selection_bg};
-                        font-family: 'Consolas', 'Monaco', monospace;
-                        font-size: {size}px;
-                    }}
-                """
-                for te in self.text_displays:
-                    te.setStyleSheet(css)
-
-                # Recolor existing inline text
-                for te, ranges in recolor_ranges:
-                    cursor = te.textCursor()
-                    for start, end, orig_color in ranges:
-                        cr = lerp(orig_color.red(), tr_, t)
-                        cg = lerp(orig_color.green(), tg_, t)
-                        cb = lerp(orig_color.blue(), tb_, t)
-                        ca = lerp(orig_color.alpha(), ta_, t)
-                        cursor.setPosition(start)
-                        cursor.setPosition(end, QTextCursor.KeepAnchor)
-                        fmt = QTextCharFormat()
-                        fmt.setForeground(QColor(cr, cg, cb, ca))
-                        cursor.mergeCharFormat(fmt)
-
-                step[0] += 1
-            else:
-                css = f"""
-                    QTextEdit {{
-                        background-color: transparent; border: none;
-                        color: rgba({tr_}, {tg_}, {tb_}, {ta_});
-                        selection-background-color: {selection_bg};
-                        font-family: 'Consolas', 'Monaco', monospace;
-                        font-size: {size}px;
-                    }}
-                """
-                for te in self.text_displays:
-                    te.setStyleSheet(css)
-
-                # Final recolor pass
-                for te, ranges in recolor_ranges:
-                    cursor = te.textCursor()
-                    for start, end, _ in ranges:
-                        cursor.setPosition(start)
-                        cursor.setPosition(end, QTextCursor.KeepAnchor)
-                        fmt = QTextCharFormat()
-                        fmt.setForeground(QColor(tr_, tg_, tb_, ta_))
-                        cursor.mergeCharFormat(fmt)
-
-                self._dm_text_timer.stop()
-                self._dm_text_timer.deleteLater()
-                delattr(self, '_dm_text_timer')
-
-        self._dm_text_timer = QTimer(self)
-        self._dm_text_timer.timeout.connect(tick)
-        self._dm_text_timer.start(16)
+        anim.valueChanged.connect(update_text_transition)
+        
+        # 5. Start and store
+        self._dm_text_anim = anim
+        anim.start()
 
     def _animate_input_dark_mode(self, target_bg: str, target_text: str,
                                   target_focus: str, steps: int):
@@ -5166,7 +5178,7 @@ Keys:
 
         self._dm_input_timer = QTimer(self)
         self._dm_input_timer.timeout.connect(tick)
-        self._dm_input_timer.start(16)
+        self._dm_input_timer.start(0)
 
     # ------------------------------------------------------------------
     # Pop-out / Dock  (/pop extracts to external window, /dock returns)
@@ -5450,17 +5462,17 @@ Keys:
     def _animate_frame_opacity(self, target_alpha: int, duration_steps: int = 25):
         """
         Animate terminal_frame background-color alpha from current to target.
-
-        The border and border-radius are preserved; only the fill opacity
-        changes — transparent (0) when embedded in the scene, opaque (~230)
-        when popped out to an external window.
+        Uses QVariantAnimation for time-respecting, lag-resistant transitions.
         """
-        # Kill any running frame opacity animation
-        if hasattr(self, '_frame_opacity_timer'):
-            self._frame_opacity_timer.stop()
-            self._frame_opacity_timer.deleteLater()
+        import re as _re
 
-        # Determine correct background RGB + border for dark/light mode
+        # 1. Kill any running frame opacity animation safely
+        if hasattr(self, '_frame_opacity_anim') and self._frame_opacity_anim:
+            self._frame_opacity_anim.stop()
+            self._frame_opacity_anim.deleteLater()
+            self._frame_opacity_anim = None
+
+        # 2. Determine correct background RGB + border based on current mode
         dark = getattr(self, '_is_dark_mode', False)
         if dark:
             r, g, b = 30, 30, 35
@@ -5469,42 +5481,34 @@ Keys:
             r, g, b = 255, 255, 255
             border_css = "border: 2px solid rgba(150, 150, 150, 200);"
 
-        # Parse current alpha from the stylesheet
+        # 3. Parse current alpha from the stylesheet to ensure a smooth start
         current_style = self.terminal_frame.styleSheet()
-        import re as _re
         m = _re.search(r'background-color:\s*rgba\(\s*\d+\s*,\s*\d+\s*,\s*\d+\s*,\s*(\d+)', current_style)
         start_alpha = int(m.group(1)) if m else 0
 
-        step = [0]
+        # 4. Initialize the QVariantAnimation
+        anim = QVariantAnimation(self)
+        # Map original duration_steps to milliseconds (~16ms per step)
+        anim.setDuration(duration_steps * 16)
+        anim.setStartValue(start_alpha)
+        anim.setEndValue(target_alpha)
+        anim.setEasingCurve(QEasingCurve.InOutQuad)  # Standard smoothstep equivalent
 
-        def tick():
-            if step[0] <= duration_steps:
-                t = step[0] / duration_steps
-                t = t * t * (3.0 - 2.0 * t)   # ease-in-out
-                alpha = int(start_alpha + (target_alpha - start_alpha) * t)
-                self.terminal_frame.setStyleSheet(f"""
-                    QFrame {{
-                        background-color: rgba({r}, {g}, {b}, {alpha});
-                        {border_css}
-                        border-radius: 5px;
-                    }}
-                """)
-                step[0] += 1
-            else:
-                self.terminal_frame.setStyleSheet(f"""
-                    QFrame {{
-                        background-color: rgba({r}, {g}, {b}, {target_alpha});
-                        {border_css}
-                        border-radius: 5px;
-                    }}
-                """)
-                self._frame_opacity_timer.stop()
-                self._frame_opacity_timer.deleteLater()
-                delattr(self, '_frame_opacity_timer')
+        def update_opacity(alpha_value):
+            # Update the entire stylesheet with the new interpolated alpha
+            self.terminal_frame.setStyleSheet(f"""
+                QFrame {{
+                    background-color: rgba({r}, {g}, {b}, {alpha_value});
+                    {border_css}
+                    border-radius: 5px;
+                }}
+            """)
 
-        self._frame_opacity_timer = QTimer(self)
-        self._frame_opacity_timer.timeout.connect(tick)
-        self._frame_opacity_timer.start(16)
+        anim.valueChanged.connect(update_opacity)
+
+        # 5. Store reference and start
+        self._frame_opacity_anim = anim
+        anim.start()
 
     # ------------------------------------------------------------------
     # Resize handling
