@@ -13,6 +13,7 @@ import signal
 import sys
 import os
 import glob
+import threading
 
 # Add parent directory to path for imports
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
@@ -730,7 +731,7 @@ class AppLauncherWidget(QWidget):
             self._anim_timer.deleteLater()
         self._anim_timer = QTimer(self)
         self._anim_timer.timeout.connect(self._anim_tick)
-        self._anim_timer.start(16)
+        self._anim_timer.start(0)
 
     def _stop_timer(self):
         if self._anim_timer is not None:
@@ -1000,6 +1001,33 @@ class RioWindow(QMainWindow):
         self.voice_control_proxy.setVisible(False)
         # Shadow + perspective tilt on proxy — managed by the widget
         self.voice_control.attach_proxy_shadow(self.voice_control_proxy)
+        self.voice_control.flicker_triggered.connect(self._send_flicker_context_to_ai)
+
+    def _send_flicker_context_to_ai(self):
+        """Retrieves live compacted code and sends it to the active AI agent."""
+        rio_fs = self.rio_server.filesystem
+        if not rio_fs or not hasattr(rio_fs, 'context_file'):
+            return
+
+        # Get the smart-compacted code from the context file
+        compacted_context = rio_fs.context_file.get_all_code()
+        
+        # Build the payload
+        # We wrap it in a system header so the AI knows why it's receiving this
+        payload = f"[SYSTEM: User triggered flicker. Current Scene Context:]\n{compacted_context}"
+        
+        # Send to the active agent input
+        agent_input = os.path.join(self.voice_control.llmfs_mount, "av", "input")
+        
+        def _write():
+            try:
+                with open(agent_input, 'w') as f:
+                    f.write(payload)
+                print(f"[AIVoice] Sent {len(compacted_context)} chars of CONTEXT to AI.")
+            except Exception as e:
+                print(f"Error sending context: {e}")
+
+        threading.Thread(target=_write, daemon=True).start()
     
     def _init_debug_overlay(self):
         """Create the debug overlay widget on the main window (not the scene).
@@ -1082,41 +1110,29 @@ class RioWindow(QMainWindow):
     # ---- unified dark-mode animation (single timer) ----
 
     def _start_dark_mode_animation(self, to_dark: bool, steps: int):
-        """Run a single QTimer that batch-updates the scene background and
-        every QGraphicsDropShadowEffect each tick.
-
-        Previous implementation created one QTimer *per* shadow effect which
-        caused severe lag when many widgets were on screen.  This version
-        collects all targets up-front and drives them from one timer.
+        """
+        Run a single batch-update for the scene background and all shadows.
+        Uses QVariantAnimation to prevent lag when many widgets are present.
         """
         from PySide6.QtWidgets import QGraphicsDropShadowEffect as _DSE
 
-        # Kill any in-flight dark-mode animation
-        if self._dark_mode_bg_timer is not None:
-            self._dark_mode_bg_timer.stop()
-            self._dark_mode_bg_timer.deleteLater()
-            self._dark_mode_bg_timer = None
+        # 1. Kill any in-flight animation to prevent "Use-After-Free" crashes
+        if hasattr(self, '_dark_mode_bg_anim') and self._dark_mode_bg_anim:
+            self._dark_mode_bg_anim.stop()
+            self._dark_mode_bg_anim.deleteLater()
+            self._dark_mode_bg_anim = None
 
-        # --- Snapshot current state ---
-
-        # Background
+        # 2. Snapshot Background State
         brush = self.graphics_scene.backgroundBrush()
         start_bg = brush.color()
         bg_sr, bg_sg, bg_sb = start_bg.red(), start_bg.green(), start_bg.blue()
-        if to_dark:
-            bg_tr, bg_tg, bg_tb = 18, 18, 25
-        else:
-            bg_tr, bg_tg, bg_tb = 250, 250, 250
+        
+        # Target Background Colors
+        bg_tr, bg_tg, bg_tb = (18, 18, 25) if to_dark else (250, 250, 250)
 
-        # Shadows — collect (effect, start_color) tuples once
+        # 3. Snapshot Shadow States — collect (effect, start_color) tuples once
+        # This prevents expensive 'items()' lookups during the animation loop
         target_shadow_color = QColor(255, 255, 255, 160) if to_dark else QColor(0, 0, 0, 120)
-        shadow_targets = []
-        for item in self.graphics_scene.items():
-            effect = item.graphicsEffect()
-            if isinstance(effect, _DSE):
-                shadow_targets.append((effect, QColor(effect.color())))
-
-        # Pre-extract target RGBA once
         ts_r, ts_g, ts_b, ts_a = (
             target_shadow_color.red(),
             target_shadow_color.green(),
@@ -1124,46 +1140,47 @@ class RioWindow(QMainWindow):
             target_shadow_color.alpha(),
         )
 
-        step = [0]
+        shadow_targets = []
+        for item in self.graphics_scene.items():
+            effect = item.graphicsEffect()
+            if isinstance(effect, _DSE):
+                # Store the effect and its unique starting color
+                shadow_targets.append({
+                    'effect': effect,
+                    'sr': effect.color().red(),
+                    'sg': effect.color().green(),
+                    'sb': effect.color().blue(),
+                    'sa': effect.color().alpha()
+                })
 
-        # Suppress per-item repaints while we batch-update; the single
-        # setBackgroundBrush at the end of each tick triggers one
-        # scene-wide repaint anyway (FullViewportUpdate mode).
-        def tick():
-            if step[0] <= steps:
-                t = step[0] / steps
-                t = t * t * (3.0 - 2.0 * t)  # smoothstep ease-in-out
+        # 4. Initialize the Batch Animation
+        anim = QVariantAnimation(self)
+        anim.setDuration(steps * 16) # Maintain the intended timing
+        anim.setStartValue(0.0)
+        anim.setEndValue(1.0)
+        anim.setEasingCurve(QEasingCurve.InOutQuad) # Smoothstep equivalent
 
-                # -- Background --
-                r = int(bg_sr + (bg_tr - bg_sr) * t)
-                g = int(bg_sg + (bg_tg - bg_sg) * t)
-                b = int(bg_sb + (bg_tb - bg_sb) * t)
-                self.graphics_scene.setBackgroundBrush(QBrush(QColor(r, g, b)))
+        def update_scene_batch(t):
+            # -- Interpolate and set Background --
+            r = int(bg_sr + (bg_tr - bg_sr) * t)
+            g = int(bg_sg + (bg_tg - bg_sg) * t)
+            b = int(bg_sb + (bg_tb - bg_sb) * t)
+            self.graphics_scene.setBackgroundBrush(QBrush(QColor(r, g, b)))
 
-                # -- All shadows in one pass --
-                for effect, sc in shadow_targets:
-                    sr = int(sc.red()   + (ts_r - sc.red())   * t)
-                    sg = int(sc.green() + (ts_g - sc.green()) * t)
-                    sb = int(sc.blue()  + (ts_b - sc.blue())  * t)
-                    sa = int(sc.alpha() + (ts_a - sc.alpha()) * t)
-                    effect.setColor(QColor(sr, sg, sb, sa))
+            # -- Interpolate all shadows in one batch pass --
+            # We iterate through our cached list of dictionaries for maximum speed
+            for data in shadow_targets:
+                sr = int(data['sr'] + (ts_r - data['sr']) * t)
+                sg = int(data['sg'] + (ts_g - data['sg']) * t)
+                sb = int(data['sb'] + (ts_b - data['sb']) * t)
+                sa = int(data['sa'] + (ts_a - data['sa']) * t)
+                data['effect'].setColor(QColor(sr, sg, sb, sa))
 
-                step[0] += 1
-            else:
-                # Final values
-                self.graphics_scene.setBackgroundBrush(
-                    QBrush(QColor(bg_tr, bg_tg, bg_tb))
-                )
-                for effect, _ in shadow_targets:
-                    effect.setColor(target_shadow_color)
+        anim.valueChanged.connect(update_scene_batch)
 
-                self._dark_mode_bg_timer.stop()
-                self._dark_mode_bg_timer.deleteLater()
-                self._dark_mode_bg_timer = None
-
-        self._dark_mode_bg_timer = QTimer(self)
-        self._dark_mode_bg_timer.timeout.connect(tick)
-        self._dark_mode_bg_timer.start(16)
+        # 5. Store and start
+        self._dark_mode_bg_anim = anim
+        anim.start()
 
     def _launch_onboarding(self):
         """Launch the onboarding tutorial by executing onboarding.py
@@ -1217,6 +1234,7 @@ class RioWindow(QMainWindow):
         
         # Create graphics scene — large canvas with (0,0) at center.
         self.graphics_scene = QGraphicsScene()
+        self.graphics_scene.setItemIndexMethod(QGraphicsScene.ItemIndexMethod.NoIndex)
         scene_half = 10000  # total scene: 20000 x 20000
         self.graphics_scene.setSceneRect(
             -scene_half, -scene_half,
@@ -2040,7 +2058,7 @@ class RioWindow(QMainWindow):
                 llmfs_mount=self.rio_server.llmfs_mount,
                 rio_mount=self.rio_server.rio_mount,
             )
-            self.current_terminal.resize(100, 150)
+            self.current_terminal.resize(10, 10)
             self.current_terminal.setAttribute(Qt.WA_TranslucentBackground, True)
             self.current_terminal.setAutoFillBackground(False)
             
@@ -2075,10 +2093,10 @@ class RioWindow(QMainWindow):
             
             frame_rect = QRectF(scene_start, scene_end).normalized()
             
-            if frame_rect.width() < 100:
-                frame_rect.setWidth(100)
-            if frame_rect.height() < 150:
-                frame_rect.setHeight(150)
+            #if frame_rect.width() < 100:
+            #    frame_rect.setWidth(100)
+            #if frame_rect.height() < 150:
+            #    frame_rect.setHeight(150)
             
             self.current_proxy.setPos(frame_rect.x(), frame_rect.y())
             self.current_terminal.resize(
