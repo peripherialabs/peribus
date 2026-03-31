@@ -45,7 +45,7 @@ from PySide6.QtGui import (
     QRadialGradient, QCursor, QTransform,
 )
 from PySide6.QtCore import (
-    Qt, QPointF, QTimer, Signal, QRectF, QElapsedTimer,
+    Qt, QPointF, QTimer, Signal, QRectF, QElapsedTimer, QVariantAnimation, QEasingCurve
 )
 
 # Mount paths are instance attributes on AIVoiceControlWidget,
@@ -62,6 +62,7 @@ AGENT_PROFILES = {
         "init_cmd": "av av",                              # written to /n/llm/ctl
         "default_voice": "Aoede",
         "config_extra": {"google_search": True},        # extra config keys
+        #"config_extra": {"google_search": True, "video_mode": "screen"},
         "iris_color": QColor(80, 140, 220),
         "iris_rim_color": QColor(40, 80, 160),
         "eye_width_scale": 1.0,
@@ -185,6 +186,7 @@ class AIVoiceControlWidget(QWidget):
 
     recording_state_changed = Signal(bool)
     agent_changed = Signal(str)
+    flicker_triggered = Signal()
 
     @staticmethod
     def _detect_mount(subdir, marker_file, exclude=None):
@@ -1020,32 +1022,46 @@ class AIVoiceControlWidget(QWidget):
 
     # ── Eye toggle ───────────────────────────────────────────────────────
     def _toggle_eyes(self):
+        # 1. Clean up existing animation to avoid the "Use-After-Free" crash
+        if hasattr(self, '_eye_toggle_anim') and self._eye_toggle_anim:
+            self._eye_toggle_anim.stop()
+            self._eye_toggle_anim.deleteLater()
+
         self.is_animating = True
+        target = 0.0 if self.eyes_are_closed else 1.0
+        
+        # 2. Setup QVariantAnimation (Time-based, not Frame-based)
+        anim = QVariantAnimation(self)
+        anim.setDuration(250) # 250ms fixed duration regardless of FPS
+        anim.setStartValue(self.blink_progress)
+        anim.setEndValue(target)
+        anim.setEasingCurve(QEasingCurve.InOutCubic) # Smoother than manual _ease
+
+        def update_blink(value):
+            self.blink_progress = value
+            self.update()
+
+        anim.valueChanged.connect(update_blink)
+        anim.finished.connect(lambda: setattr(self, 'is_animating', False))
+        
+        # Update logic state
         if self.eyes_are_closed:
-            self.blink_direction = -1
             self.eyes_are_closed = False
             self.is_recording = True
-            self.recording_state_changed.emit(True)
             self._ensure_code_route()
             self._send_ctl("start")
-            self._mouse_poll_timer.start(33)  # ~30 fps cursor polling
+            self._mouse_poll_timer.start(33)
             self._start_autonomous_animations()
         else:
-            self.blink_direction = 1
             self.eyes_are_closed = True
             self.is_recording = False
-            self.recording_state_changed.emit(False)
             self._send_ctl("stop")
             self._teardown_code_route()
             self._mouse_poll_timer.stop()
             self._stop_autonomous_animations()
-        self.blink_timer.stop()
-        try:
-            self.blink_timer.timeout.disconnect()
-        except RuntimeError:
-            pass
-        self.blink_timer.timeout.connect(self._update_toggle_animation)
-        self.blink_timer.start(16)
+
+        self._eye_toggle_anim = anim
+        anim.start()
 
     def _update_toggle_animation(self):
         speed = 0.08
@@ -1066,6 +1082,8 @@ class AIVoiceControlWidget(QWidget):
             return
         self._flicker_queued = True
         self._start_flicker_blink()
+        self.flicker_triggered.emit()
+
 
     def _start_flicker_blink(self):
         if self.is_flickering:
