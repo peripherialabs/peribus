@@ -43,6 +43,11 @@ from .av_agent import AVAgent, AVConfig
 from .av_grok_agent import GrokAVAgent, GrokAVConfig
 from .av_openai_agent import OpenAIAVAgent, OpenAIAVConfig
 from .ts_agent import TSAgent
+from .embedding import EmbedAgent
+from .meta_agent import (
+    MetaAgent, get_agents_dir,
+    load_saved_module, list_saved_modules,
+)
 
 
 
@@ -115,6 +120,38 @@ class LLMFSCtlHandler(CtlHandler):
             voice = parts[1] if len(parts) > 1 else None
             self.fs.create_ts_agent(name, voice=voice)
             return f"TS Agent '{name}' created"
+
+        elif cmd == "embed":
+            # Create new embedding agent: embed [name]
+            if not arg:
+                arg = "embed"
+            name = arg.split()[0]
+            self.fs.create_embed_agent(name)
+            return f"Embed Agent '{name}' created"
+
+        elif cmd == "meta":
+            # Create the meta-agent: meta [name] [provider] [model]
+            #
+            # By default it lands at /<root>/meta with whatever the root
+            # provider is. The meta-agent's job is to write source code
+            # for other agents (see meta_agent.py).
+            parts = arg.split() if arg else []
+            name = parts[0] if len(parts) > 0 else "meta"
+            provider = parts[1] if len(parts) > 1 else None
+            model = parts[2] if len(parts) > 2 else None
+            self.fs.create_meta_agent(name, provider, model)
+            return f"Meta Agent '{name}' created"
+
+        elif cmd == "load":
+            # Load a saved custom agent from $LLMFS_AGENTS_DIR.
+            # Usage: load <name>
+            if not arg:
+                # No arg → list what's available.
+                names = list_saved_modules(self.fs.agents_dir)
+                return " ".join(names) if names else "(none)"
+            name = arg.split()[0]
+            self.fs.load_custom_agent(name)
+            return f"Custom agent '{name}' loaded"
         
         elif cmd == "delete":
             if not arg:
@@ -148,7 +185,7 @@ class LLMFSCtlHandler(CtlHandler):
                 raise ValueError("Usage: machine add|remove|list <name>")
         
         else:
-            raise ValueError(f"Unknown command: {cmd}. Available: provider, new, av, grok, openai, ts, delete, machine")
+            raise ValueError(f"Unknown command: {cmd}. Available: provider, new, av, grok, openai, ts, embed, meta, load, delete, machine")
     
     async def get_status(self) -> bytes:
         lines = [
@@ -158,6 +195,11 @@ class LLMFSCtlHandler(CtlHandler):
             f"grok_av_agents {len(self.fs.grok_av_agents)}",
             f"openai_av_agents {len(self.fs.openai_av_agents)}",
             f"ts_agents {len(self.fs.ts_agents)}",
+            f"embed_agents {len(self.fs.embed_agents)}",
+            f"meta_agents {len(self.fs.meta_agents)}",
+            f"custom_agents {len(self.fs.custom_agents)}",
+            f"agents_dir {self.fs.agents_dir}",
+            f"saved {' '.join(list_saved_modules(self.fs.agents_dir)) or '(none)'}",
             f"machines {' '.join(self.fs.get_machines()) or '(none)'}",
         ]
         return ("\n".join(lines) + "\n").encode()
@@ -276,6 +318,21 @@ class LLMFSRoot(SyntheticDir):
         
         # TS agents
         self.ts_agents: Dict[str, TSAgent] = {}
+
+        self.embed_agents: Dict[str, EmbedAgent] = {}
+
+        # Meta-agents (LLM agents that write other agents' code)
+        self.meta_agents: Dict[str, MetaAgent] = {}
+
+        # Custom agents loaded from $LLMFS_AGENTS_DIR. Each is a generic
+        # SyntheticDir whose schema is defined by the generated module.
+        # Stored separately because we don't own their lifecycle (no
+        # uniform stop()/cancel() contract beyond what they expose).
+        self.custom_agents: Dict[str, SyntheticDir] = {}
+
+        # Resolve persistence dir once at construction; honour
+        # $LLMFS_AGENTS_DIR with a sensible default.
+        self.agents_dir = get_agents_dir()
         
         # Global function registry for AV agents (shared by Gemini, Grok, and OpenAI)
         self.function_registry = {}
@@ -287,6 +344,11 @@ class LLMFSRoot(SyntheticDir):
         # Build filesystem tree
         self.add(CtlFile("ctl", LLMFSCtlHandler(self)))
         self.add(ProvidersFile())
+
+        # Re-load any custom agents persisted from previous sessions.
+        # Failures are logged to stderr rather than crashing the server
+        # — one broken file shouldn't take the whole filesystem down.
+        self._autoload_saved_agents()
     
     def _check_name(self, name: str):
         """Validate that an agent name doesn't conflict with reserved files"""
@@ -294,7 +356,8 @@ class LLMFSRoot(SyntheticDir):
             raise ValueError(f"Name '{name}' is reserved (conflicts with {name} file)")
         if (name in self.agents or name in self.av_agents 
                 or name in self.grok_av_agents or name in self.openai_av_agents
-                or name in self.ts_agents):
+                or name in self.ts_agents or name in self.embed_agents
+                or name in self.meta_agents or name in self.custom_agents):
             raise ValueError(f"Agent '{name}' already exists")
     
     async def set_provider(self, name: str):
@@ -334,6 +397,123 @@ class LLMFSRoot(SyntheticDir):
         agent._fs_root = self
         
         return agent
+
+    def create_embed_agent(
+        self,
+        name: str = "embed",
+    ) -> EmbedAgent:
+        """Create a new embedding filesystem agent"""
+        self._check_name(name)
+
+        agent = EmbedAgent(name=name)
+
+        # Try to load existing index from disk
+        agent.load_from_disk()
+
+        self.embed_agents[name] = agent
+        self.add(agent)
+
+        return agent
+
+    def create_meta_agent(
+        self,
+        name: str = "meta",
+        provider_name: str = None,
+        model: str = None,
+    ) -> MetaAgent:
+        """
+        Create a meta-agent. Talk to it to generate code for new agent types.
+        See llmfs.meta_agent for the full contract.
+        """
+        self._check_name(name)
+
+        provider = self.provider
+        if provider_name:
+            provider = get_provider(provider_name)
+
+        agent = MetaAgent(
+            name=name,
+            provider=provider,
+            fs_root=self,
+            default_model=model,
+        )
+
+        self.meta_agents[name] = agent
+        self.add(agent)
+
+        # Same machine-rule back-channel the standard Agent uses.
+        agent._fs_root = self
+
+        return agent
+
+    def mount_custom_agent(
+        self,
+        name: str,
+        instance: SyntheticDir,
+        source_path=None,
+    ):
+        """
+        Mount a SyntheticDir produced by a generated module under the root.
+
+        Called by MetaAgent.build_from_last_output and load_custom_agent.
+        Idempotent-ish: if a custom agent of the same name is already
+        mounted, it's replaced (the old one is dropped).
+        """
+        # Make sure the instance presents the requested name; the contract
+        # says create(name) honours it, but defensive-rename if needed so
+        # the directory entry matches the dict key.
+        if instance.name != name:
+            instance.name = name
+
+        if name in self.custom_agents:
+            # Replace: remove the old node so .add() doesn't double-add.
+            self.remove(name)
+            self.custom_agents.pop(name, None)
+        else:
+            # Could collide with a non-custom agent slot; _check_name was
+            # the caller's job, but be safe.
+            try:
+                self._check_name(name)
+            except ValueError:
+                # Name is taken by something we don't own — refuse rather
+                # than overwrite a built-in agent type.
+                raise
+
+        self.custom_agents[name] = instance
+        self.add(instance)
+
+        if source_path is not None:
+            # Stash for diagnostics (e.g. so we can show where it came from).
+            setattr(instance, "_source_path", str(source_path))
+
+    def load_custom_agent(self, name: str) -> SyntheticDir:
+        """
+        Load a saved custom agent from $LLMFS_AGENTS_DIR by name.
+
+        Used by `echo 'load <name>' > ctl` and by startup auto-load.
+        """
+        module, path = load_saved_module(name, self.agents_dir)
+        instance = module.create(name)
+        self.mount_custom_agent(name, instance, source_path=path)
+        return instance
+
+    def _autoload_saved_agents(self):
+        """
+        At startup, walk $LLMFS_AGENTS_DIR and load every .py file. One
+        broken file logs and is skipped; we don't fail the whole boot.
+        """
+        import sys
+        for name in list_saved_modules(self.agents_dir):
+            try:
+                self.load_custom_agent(name)
+            except Exception as e:
+                # No logger configured yet at this point in some setups;
+                # fall through to stderr.
+                print(
+                    f"[llmfs] WARNING: failed to load saved agent "
+                    f"'{name}': {type(e).__name__}: {e}",
+                    file=sys.stderr,
+                )
     
     def create_av_agent(
         self,
@@ -442,7 +622,7 @@ class LLMFSRoot(SyntheticDir):
         return agent
     
     def delete_agent(self, name: str):
-        """Delete an agent (text, AV, Grok AV, OpenAI AV, or TS)"""
+        """Delete an agent (text, AV, Grok AV, OpenAI AV, TS, embed, meta, or custom)"""
         if name in self.agents:
             agent = self.agents.pop(name)
             asyncio.create_task(agent.cancel())
@@ -462,6 +642,29 @@ class LLMFSRoot(SyntheticDir):
         elif name in self.ts_agents:
             agent = self.ts_agents.pop(name)
             asyncio.create_task(agent.stop())
+            self.remove(name)
+        elif name in self.embed_agents:
+            agent = self.embed_agents.pop(name)
+            asyncio.create_task(agent.stop())
+            self.remove(name)
+        elif name in self.meta_agents:
+            agent = self.meta_agents.pop(name)
+            asyncio.create_task(agent.cancel())
+            self.remove(name)
+        elif name in self.custom_agents:
+            # Custom agents are generic SyntheticDirs; we don't assume any
+            # particular shutdown method. Try common ones, ignore failures.
+            agent = self.custom_agents.pop(name)
+            for shutdown_name in ("stop", "cancel", "close"):
+                method = getattr(agent, shutdown_name, None)
+                if callable(method):
+                    try:
+                        result = method()
+                        if asyncio.iscoroutine(result):
+                            asyncio.create_task(result)
+                    except Exception:
+                        pass
+                    break
             self.remove(name)
         else:
             raise ValueError(f"Agent '{name}' not found")
@@ -485,6 +688,10 @@ class LLMFSRoot(SyntheticDir):
     def get_ts_agent(self, name: str) -> Optional[TSAgent]:
         """Get a TS agent by name"""
         return self.ts_agents.get(name)
+
+    def get_embed_agent(self, name: str) -> Optional[EmbedAgent]:
+        """Get an embedding agent by name"""
+        return self.embed_agents.get(name)
     
     def register_function(self, name: str, func):
         """Register a function for AV agents (Gemini, Grok, and OpenAI) to call"""
@@ -504,7 +711,7 @@ class LLMFSRoot(SyntheticDir):
         The "llm" machine (self) is always ignored.
         """
         name_lower = name.lower()
-        if name_lower == "llm" or name_lower in self._machines:
+        if name_lower in ["llm", "peribus"] or name_lower in self._machines:
             return
         
         self._machines.append(name_lower)

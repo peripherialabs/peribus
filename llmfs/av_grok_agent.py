@@ -328,23 +328,54 @@ class GrokAVCtlHandler(CtlHandler):
 
 
 class GrokAVInputFile(SyntheticFile):
-    """Write text messages to send during live session."""
+    """
+    Write text messages to send during live session.
+
+    Writing is buffered across 9P chunks.  The message is sent
+    on clunk (fid close) so that multi-chunk writes don't produce
+    truncated or duplicate messages.
+    """
 
     def __init__(self, agent: 'GrokAVAgent'):
         super().__init__("input")
         self.agent = agent
         self._last_input = ""
+        self._write_buffers = {}  # fid -> bytearray
 
     async def read(self, fid: FidState, offset: int, count: int) -> bytes:
         return self._last_input.encode()[offset:offset + count]
 
     async def write(self, fid: FidState, offset: int, data: bytes) -> int:
-        text = data.decode('utf-8').strip()
+        """Buffer write data — sending happens on clunk."""
+        fid_key = id(fid)
+        if fid_key not in self._write_buffers:
+            self._write_buffers[fid_key] = bytearray()
+
+        buf = self._write_buffers[fid_key]
+
+        if offset == 0 and len(buf) > 0:
+            buf.clear()
+
+        if offset + len(data) > len(buf):
+            buf.extend(b'\x00' * (offset + len(data) - len(buf)))
+        buf[offset:offset + len(data)] = data
+
+        return len(data)
+
+    async def clunk(self, fid: FidState):
+        """Send the complete buffered message on fid close."""
+        fid_key = id(fid)
+        buf = self._write_buffers.pop(fid_key, None)
+
+        if not buf:
+            return
+
+        text = bytes(buf).decode('utf-8', errors='replace').strip()
         if not text:
-            return len(data)
+            return
+
         self._last_input = text
         await self.agent.send_text(text)
-        return len(data)
 
 
 class GrokAVContextFile(SyntheticFile):
@@ -354,10 +385,8 @@ class GrokAVContextFile(SyntheticFile):
     Writing here injects context that the model will see on its next turn,
     without generating an immediate response.
 
-    The implementation appends context blocks to the session instructions
-    via session.update, which is the reliable way to get Grok's Realtime
-    API to incorporate new information mid-session. The base system prompt
-    is preserved and context blocks are appended below it.
+    Writing is buffered across 9P chunks.  The context is sent
+    on clunk (fid close) so that multi-chunk writes arrive complete.
 
     Usage:
         echo "The user's name is Alice" > /mnt/llm/grok_av/context
@@ -373,24 +402,48 @@ class GrokAVContextFile(SyntheticFile):
         super().__init__("context")
         self.agent = agent
         self._context_blocks: List[str] = []
+        self._write_buffers = {}  # fid -> bytearray
 
     async def read(self, fid: FidState, offset: int, count: int) -> bytes:
         data = ("\n".join(self._context_blocks) + "\n").encode() if self._context_blocks else b""
         return data[offset:offset + count]
 
     async def write(self, fid: FidState, offset: int, data: bytes) -> int:
-        text = data.decode('utf-8').strip()
+        """Buffer write data — context is sent on clunk."""
+        fid_key = id(fid)
+        if fid_key not in self._write_buffers:
+            self._write_buffers[fid_key] = bytearray()
+
+        buf = self._write_buffers[fid_key]
+
+        if offset == 0 and len(buf) > 0:
+            buf.clear()
+
+        if offset + len(data) > len(buf):
+            buf.extend(b'\x00' * (offset + len(data) - len(buf)))
+        buf[offset:offset + len(data)] = data
+
+        return len(data)
+
+    async def clunk(self, fid: FidState):
+        """Send the complete buffered context on fid close."""
+        fid_key = id(fid)
+        buf = self._write_buffers.pop(fid_key, None)
+
+        if not buf:
+            return
+
+        text = bytes(buf).decode('utf-8', errors='replace').strip()
         if not text:
-            return len(data)
+            return
 
         if text.lower() == "clear":
             self._context_blocks.clear()
             await self.agent._update_instructions()
-            return len(data)
+            return
 
         self._context_blocks.append(text)
-        await self.agent._update_instructions()
-        return len(data)
+        await self.agent.send_context(text)
 
     async def getattr(self):
         data = ("\n".join(self._context_blocks) + "\n").encode() if self._context_blocks else b""
@@ -1489,6 +1542,56 @@ class GrokAVAgent(SyntheticDir):
             return
         self._pending_message = text
 
+    async def send_context(self, text: str):
+        """
+        Inject context into the session without triggering a response.
+
+        Two-pronged approach (matching the OpenAI Realtime agent):
+          1. conversation.item.create — adds a user message to the conversation
+             so the model sees it in its context window (not limited by
+             instruction field size)
+          2. session.update — appends to instructions as fallback
+
+        No response.create is sent, so the model stays silent.
+        """
+        if self.state not in (GrokAVState.CONNECTED, GrokAVState.STREAMING):
+            await self.errors.post(b"Not connected\n")
+            return
+
+        if not self._websocket:
+            await self.errors.post(b"No websocket connection\n")
+            return
+
+        self.history.append(Message(
+            role="user",
+            content=text,
+            source="context",
+        ))
+
+        # Prong 1: inject as conversation item (no response.create)
+        context_event = {
+            "type": "conversation.item.create",
+            "item": {
+                "type": "message",
+                "role": "user",
+                "content": [
+                    {
+                        "type": "input_text",
+                        "text": f"[CONTEXT] {text}",
+                    }
+                ],
+            },
+        }
+        try:
+            await self._websocket.send(json.dumps(context_event))
+        except Exception as e:
+            await self.errors.post(f"Context item error: {e}\n".encode())
+
+        # Prong 2: update instructions with accumulated context
+        await self._update_instructions()
+
+        await self.errors.post(f"Context injected ({len(text)} chars)\n".encode())
+
     async def _update_instructions(self):
         """
         Re-send session.update with current system prompt + accumulated context.
@@ -1496,7 +1599,14 @@ class GrokAVAgent(SyntheticDir):
         This is the reliable mechanism to inject context mid-session:
         Grok's Realtime API always respects the instructions field from
         the most recent session.update.
+
+        The instructions field is capped at MAX_INSTRUCTIONS_CHARS to
+        avoid silent server-side truncation.  When the accumulated context
+        exceeds the budget, the oldest blocks are dropped (newest context
+        is most relevant).
         """
+        MAX_INSTRUCTIONS_CHARS = 16_000  # conservative cap
+
         if not self._websocket:
             return
         if self.state not in (GrokAVState.CONNECTED, GrokAVState.STREAMING):
@@ -1506,11 +1616,27 @@ class GrokAVAgent(SyntheticDir):
         context_blocks = self.context_file._context_blocks
 
         if context_blocks:
-            instructions = (
-                base
-                + GrokAVContextFile.CONTEXT_SEPARATOR
-                + "\n".join(context_blocks)
-            )
+            separator = GrokAVContextFile.CONTEXT_SEPARATOR
+            budget = MAX_INSTRUCTIONS_CHARS - len(base) - len(separator)
+
+            # Keep as many recent blocks as fit within the budget
+            kept = []
+            used = 0
+            for block in reversed(context_blocks):
+                cost = len(block) + 1  # +1 for the \n join
+                if used + cost > budget:
+                    break
+                kept.append(block)
+                used += cost
+            kept.reverse()
+
+            if len(kept) < len(context_blocks):
+                dropped = len(context_blocks) - len(kept)
+                await self.errors.post(
+                    f"Instructions trimmed: dropped {dropped} oldest context blocks\n".encode()
+                )
+
+            instructions = base + separator + "\n".join(kept) if kept else base
         else:
             instructions = base
 

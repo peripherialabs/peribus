@@ -122,6 +122,7 @@ class ClaudeProvider(LLMProvider):
     def get_models(self) -> List[str]:
         return [
             "claude-sonnet-4-6",
+            "claude-opus-4-7",
             "claude-opus-4-6",
             "claude-haiku-4-5-20251001"
         ]
@@ -226,6 +227,8 @@ class OpenAIProvider(LLMProvider):
     
     def get_models(self) -> List[str]:
         return [
+            "gpt-5.4",
+            "gpt-5.5",
             "gpt-5.3-codex",
             "gpt-5.2-codex",
             "gpt-5.2-2025-12-11",
@@ -451,6 +454,7 @@ class MoonShotAIProvider(LLMProvider):
     
     def get_models(self) -> List[str]:
         return [
+            "kimi-k2.6",
             "kimi-k2.5",
             "kimi-k2-instruct",
             "moonshot-v1-8k",
@@ -575,6 +579,7 @@ class FireworksProvider(LLMProvider):
     
     def get_models(self) -> List[str]:
         return [
+            "accounts/fireworks/models/kimi-k2p6",
             "accounts/fireworks/models/kimi-k2p5",
             "accounts/fireworks/models/glm-5",
             "accounts/fireworks/models/minimax-m2p5",
@@ -598,6 +603,59 @@ class FireworksProvider(LLMProvider):
                 yield chunk.choices[0].delta.content
 
 
+class DeepSeekProvider(LLMProvider):
+    """DeepSeek provider using OpenAI-compatible API"""
+    
+    def __init__(self, api_key: str = None):
+        self.api_key = api_key or os.getenv("DEEPSEEK_API_KEY")
+        if not self.api_key:
+            raise ValueError("DEEPSEEK_API_KEY not found")
+        
+        from openai import AsyncOpenAI
+        # DeepSeek is fully OpenAI-compatible
+        self.client = AsyncOpenAI(
+            api_key=self.api_key,
+            base_url="https://api.deepseek.com"
+        )
+    
+    @property
+    def name(self) -> str:
+        return "deepseek"
+    
+    def get_models(self) -> List[str]:
+        return [
+            "deepseek-v4-pro",
+            "deepseek-v4-flash",
+            # Legacy aliases (map to v4-flash non-thinking/thinking modes;
+            # scheduled for retirement 2026-07-24).
+            "deepseek-chat",
+            "deepseek-reasoner",
+        ]
+    
+    async def stream_response(self, config: ProviderConfig) -> AsyncIterator[str]:
+        messages = _build_openai_messages(config)
+        
+        stream = await self.client.chat.completions.create(
+            model=config.model,
+            messages=messages,
+            stream=True,
+            max_tokens=config.max_tokens,
+            temperature=config.temperature,
+        )
+        
+        async for chunk in stream:
+            if not chunk.choices:
+                continue
+            delta = chunk.choices[0].delta
+            # Reasoning models (deepseek-reasoner, or deepseek-v4-* in
+            # thinking mode) emit chain-of-thought in `reasoning_content`,
+            # which sits alongside `content`. Skip it and stream only the
+            # final answer, consistent with the other providers.
+            content = getattr(delta, "content", None)
+            if content:
+                yield content
+
+
 # Provider registry
 # Provider registry
 _PROVIDERS = {
@@ -610,6 +668,7 @@ _PROVIDERS = {
     "moonshot": MoonShotAIProvider,
     "ollama": OllamaProvider,
     "fireworks": FireworksProvider,
+    "deepseek": DeepSeekProvider,
 }
 
 _provider_instances: Dict[str, LLMProvider] = {}

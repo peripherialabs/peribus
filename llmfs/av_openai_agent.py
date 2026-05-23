@@ -88,7 +88,10 @@ CHUNK_SIZE = 1024
 OPENAI_REALTIME_URL = "wss://api.openai.com/v1/realtime"
 
 # Default model
-DEFAULT_MODEL = "gpt-realtime-1.5"
+#DEFAULT_MODEL = "gpt-realtime"
+#DEFAULT_MODEL = "gpt-realtime-1.5"
+#DEFAULT_MODEL = "gpt-realtime-mini"
+DEFAULT_MODEL = "gpt-realtime-2"
 
 # Available voices (GA)
 OPENAI_VOICES = [
