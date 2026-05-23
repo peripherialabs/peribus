@@ -48,11 +48,13 @@ class BackendConnection:
         host: str,
         port: int,
         response_callback: Callable[[bytes], Awaitable[None]],
+        auth_token: Optional[str] = None,
     ):
         self.name = name
         self.host = host
         self.port = port
         self._response_callback = response_callback
+        self._auth_token = auth_token
         
         self._reader: Optional[asyncio.StreamReader] = None
         self._writer: Optional[asyncio.StreamWriter] = None
@@ -174,8 +176,134 @@ class BackendConnection:
             ename = response[9:9 + ename_len].decode('utf-8')
             raise ConnectionError(f"Backend version failed: {ename}")
     
+    async def _authenticate(self) -> int:
+        """
+        Perform raw-token 9P auth against the backend. Returns the
+        afid we authenticated (which is then passed to Tattach), or
+        wire.NOFID if no token is configured.
+        
+        Uses the raw-token flow (not p9any): the backend's AuthFid
+        state machine auto-detects raw mode when our first write
+        does not look like a p9any protocol selection. After our
+        Twrite the backend authenticates the token and we Tread to
+        confirm "ok\\n" was returned (or surface the error).
+        """
+        if not self._auth_token:
+            return wire.NOFID
+        
+        afid = self.alloc_fid()
+        uname = b"mux"
+        aname = b""
+        
+        # ── Tauth ────────────────────────────────────────────────
+        auth_tag = self._next_tag
+        self._next_tag += 1
+        
+        body = bytearray()
+        body += struct.pack('<IBH', 0, wire.TAUTH, auth_tag)
+        body += struct.pack('<I', afid)
+        body += struct.pack('<H', len(uname)) + uname
+        body += struct.pack('<H', len(aname)) + aname
+        struct.pack_into('<I', body, 0, len(body))
+        
+        future = asyncio.get_event_loop().create_future()
+        self._pending[auth_tag] = future
+        await self._send_raw(bytes(body))
+        
+        response = await asyncio.wait_for(future, timeout=5.0)
+        _, mtype, _ = wire.parse_header(response)
+        if mtype == wire.RERROR:
+            ename_len = struct.unpack_from('<H', response, 7)[0]
+            ename = response[9:9 + ename_len].decode('utf-8')
+            raise ConnectionError(
+                f"Backend '{self.name}' Tauth failed: {ename}"
+            )
+        if mtype != wire.RAUTH:
+            raise ConnectionError(
+                f"Backend '{self.name}' Tauth: unexpected reply "
+                f"{wire.msg_name(mtype)}"
+            )
+        
+        # ── Twrite token to afid ─────────────────────────────────
+        token_bytes = self._auth_token.encode('utf-8')
+        write_tag = self._next_tag
+        self._next_tag += 1
+        
+        body = bytearray()
+        body += struct.pack('<IBH', 0, wire.TWRITE, write_tag)
+        body += struct.pack('<I', afid)
+        body += struct.pack('<Q', 0)              # offset
+        body += struct.pack('<I', len(token_bytes))
+        body += token_bytes
+        struct.pack_into('<I', body, 0, len(body))
+        
+        future = asyncio.get_event_loop().create_future()
+        self._pending[write_tag] = future
+        await self._send_raw(bytes(body))
+        
+        response = await asyncio.wait_for(future, timeout=5.0)
+        _, mtype, _ = wire.parse_header(response)
+        if mtype == wire.RERROR:
+            ename_len = struct.unpack_from('<H', response, 7)[0]
+            ename = response[9:9 + ename_len].decode('utf-8')
+            raise ConnectionError(
+                f"Backend '{self.name}' auth Twrite failed: {ename}"
+            )
+        if mtype != wire.RWRITE:
+            raise ConnectionError(
+                f"Backend '{self.name}' auth Twrite: unexpected reply "
+                f"{wire.msg_name(mtype)}"
+            )
+        
+        # ── Tread to confirm status ──────────────────────────────
+        read_tag = self._next_tag
+        self._next_tag += 1
+        
+        body = bytearray()
+        body += struct.pack('<IBH', 0, wire.TREAD, read_tag)
+        body += struct.pack('<I', afid)
+        body += struct.pack('<Q', 0)              # offset
+        body += struct.pack('<I', 256)            # count
+        struct.pack_into('<I', body, 0, len(body))
+        
+        future = asyncio.get_event_loop().create_future()
+        self._pending[read_tag] = future
+        await self._send_raw(bytes(body))
+        
+        response = await asyncio.wait_for(future, timeout=5.0)
+        _, mtype, _ = wire.parse_header(response)
+        if mtype == wire.RERROR:
+            ename_len = struct.unpack_from('<H', response, 7)[0]
+            ename = response[9:9 + ename_len].decode('utf-8')
+            raise ConnectionError(
+                f"Backend '{self.name}' auth Tread failed: {ename}"
+            )
+        if mtype != wire.RREAD:
+            raise ConnectionError(
+                f"Backend '{self.name}' auth Tread: unexpected reply "
+                f"{wire.msg_name(mtype)}"
+            )
+        # Rread body: count[4] data[count]
+        rcount = struct.unpack_from('<I', response, 7)[0]
+        rdata = bytes(response[11:11 + rcount])
+        status = rdata.rstrip(b'\0').decode('utf-8', errors='replace').strip()
+        if not status.startswith("ok"):
+            raise ConnectionError(
+                f"Backend '{self.name}' auth rejected: {status or 'no status'}"
+            )
+        
+        logger.info(f"Backend '{self.name}' authenticated (afid={afid})")
+        return afid
+    
     async def _attach(self):
-        """Send Tattach to get root fid."""
+        """
+        Authenticate (if a token is configured) and send Tattach to get
+        the root fid.
+        """
+        # Authenticate first if we have a token. This returns the afid
+        # we then quote in Tattach. If no token, we get NOFID.
+        afid = await self._authenticate()
+        
         self.root_fid = self.alloc_fid()
         tag = self._next_tag
         self._next_tag += 1
@@ -186,7 +314,7 @@ class BackendConnection:
         body = bytearray()
         body += struct.pack('<IBH', 0, wire.TATTACH, tag)
         body += struct.pack('<I', self.root_fid)
-        body += struct.pack('<I', wire.NOFID)  # afid
+        body += struct.pack('<I', afid)  # afid (NOFID when no auth)
         body += struct.pack('<H', len(uname)) + uname
         body += struct.pack('<H', len(aname)) + aname
         struct.pack_into('<I', body, 0, len(body))
@@ -200,11 +328,22 @@ class BackendConnection:
         
         _, mtype, _ = wire.parse_header(response)
         if mtype == wire.RATTACH:
-            logger.debug(f"Backend '{self.name}' attached, root_fid={self.root_fid}")
+            logger.debug(
+                f"Backend '{self.name}' attached, root_fid={self.root_fid}"
+            )
         elif mtype == wire.RERROR:
             ename_len = struct.unpack_from('<H', response, 7)[0]
             ename = response[9:9 + ename_len].decode('utf-8')
             raise ConnectionError(f"Backend attach failed: {ename}")
+        else:
+            raise ConnectionError(
+                f"Backend '{self.name}' Tattach: unexpected reply "
+                f"{wire.msg_name(mtype)}"
+            )
+        
+        # We don't clunk the afid — the backend keeps it alive for the
+        # session, and clunking is unnecessary since the TCP teardown
+        # will reap it. Clunking is also safe to do but adds a roundtrip.
     
     async def send(self, data: bytes, client_tag: int) -> int:
         """

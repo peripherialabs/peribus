@@ -22,5 +22,7 @@ Then:
 from .server import MuxServer
 from .mux import MuxConnection
 from .backend import BackendConnection
+from .auth import AuthManager, AuthContext, AuthFid
 
-__all__ = ['MuxServer', 'MuxConnection', 'BackendConnection']
+__all__ = ['MuxServer', 'MuxConnection', 'BackendConnection',
+           'AuthManager', 'AuthContext', 'AuthFid']

@@ -15,11 +15,28 @@ Usage:
 
 import asyncio
 import logging
-from typing import Dict, Tuple
+from typing import Dict, Optional, Tuple
 
 from .mux import MuxConnection
+from .auth import AuthManager
 
 logger = logging.getLogger("riomux.server")
+
+
+def _normalize_server_cfg(cfg) -> Tuple[str, int, Optional[str]]:
+    """
+    Accept (host, port) or (host, port, token) and return the canonical
+    3-tuple form. Lets old call sites that pass 2-tuples keep working.
+    """
+    if len(cfg) == 2:
+        host, port = cfg
+        return (host, int(port), None)
+    if len(cfg) == 3:
+        host, port, token = cfg
+        return (host, int(port), token if token else None)
+    raise ValueError(
+        f"Backend config must be (host, port) or (host, port, token), got {cfg!r}"
+    )
 
 
 class MuxServer:
@@ -33,16 +50,29 @@ class MuxServer:
     Supports dynamic backend add/remove — changes propagate to all
     existing client connections (new walks will see the new backend;
     existing fids to removed backends remain valid until clunked).
+    
+    Auth: If an AuthManager with secrets is provided, all clients must
+    authenticate via Tauth before Tattach is allowed.
     """
     
-    def __init__(self, backends: Dict[str, Tuple[str, int]]):
+    def __init__(self, backends: Dict[str, Tuple],
+                 auth_manager: AuthManager = None):
         """
         Args:
-            backends: Mapping of backend name → (host, port).
-                      e.g. {"rio": ("127.0.0.1", 5641),
-                            "llm": ("127.0.0.1", 5640)}
+            backends: Mapping of backend name → (host, port) OR
+                      (host, port, token). The 3-tuple form makes the
+                      server Tauth+token before Tattach when talking to
+                      that backend (e.g. another riomux or an authed rio).
+            auth_manager: Optional AuthManager for the mux's own auth.
+                          If None or no secrets, mux-side auth is off.
         """
-        self.backends = dict(backends)  # mutable copy
+        # Normalize to canonical (host, port, token_or_None) shape so
+        # everything downstream — connections, ctl, notify helpers —
+        # speaks the same dialect.
+        self.backends: Dict[str, Tuple[str, int, Optional[str]]] = {
+            n: _normalize_server_cfg(cfg) for n, cfg in backends.items()
+        }
+        self._auth_manager = auth_manager or AuthManager()
         self._server: asyncio.Server = None
         self._conn_id = 0
         self._connections: Dict[int, MuxConnection] = {}
@@ -56,7 +86,14 @@ class MuxServer:
         
         addr = self._server.sockets[0].getsockname()
         logger.info(f"riomux listening on {addr[0]}:{addr[1]}")
-        logger.info(f"Backends: {', '.join(f'{n}={h}:{p}' for n, (h, p) in self.backends.items())}")
+        # Don't log tokens — only host:port and an auth marker.
+        logger.info(
+            "Backends: "
+            + ', '.join(
+                f"{n}={h}:{p}{' +auth' if t else ''}"
+                for n, (h, p, t) in self.backends.items()
+            )
+        )
         
         # Notify LLM backends about all initial machines
         await self._notify_llm_backends_machines_initial()
@@ -77,10 +114,14 @@ class MuxServer:
     
     # ── Dynamic backend management ──────────────────────────────
     
-    async def add_backend(self, name: str, host: str, port: int) -> bool:
+    async def add_backend(self, name: str, host: str, port: int,
+                          token: Optional[str] = None) -> bool:
         """
         Add a backend at runtime. Immediately visible to all clients
         on their next directory read or walk.
+        
+        If `token` is set, per-client BackendConnections to this backend
+        will perform 9P Tauth with that token before Tattach.
         
         Also notifies all LLM backends about the new machine via
         their ctl file: echo 'machine add <name>' > $llm/ctl
@@ -88,17 +129,21 @@ class MuxServer:
         Returns True if added, False if name already exists.
         """
         if name in self.backends:
-            logger.warning(f"Backend '{name}' already exists ({self.backends[name]})")
+            host_only = self.backends[name][:2]
+            logger.warning(f"Backend '{name}' already exists ({host_only})")
             return False
         
-        self.backends[name] = (host, port)
+        self.backends[name] = (host, port, token)
         
         # Propagate to all active connections
         for conn in self._connections.values():
-            conn.add_backend(name, host, port)
+            conn.add_backend(name, host, port, token=token)
         
-        logger.info(f"Backend '{name}' added: {host}:{port} "
-                     f"(propagated to {len(self._connections)} connections)")
+        logger.info(
+            f"Backend '{name}' added: {host}:{port}"
+            f"{' +auth' if token else ''} "
+            f"(propagated to {len(self._connections)} connections)"
+        )
         
         # Notify LLM backends about all machines
         await self._notify_llm_backends_machine_add(name)
@@ -133,19 +178,31 @@ class MuxServer:
                      f"(propagated to {len(self._connections)} connections)")
         return True
     
-    def list_backends(self) -> Dict[str, Tuple[str, int]]:
-        """Return current backend configuration."""
+    def list_backends(self) -> Dict[str, Tuple[str, int, Optional[str]]]:
+        """
+        Return current backend configuration as (host, port, token).
+        Callers handling this output should treat the token as sensitive.
+        """
         return dict(self.backends)
     
     async def _propagate_add(self, name: str, host: str, port: int,
+                              token: Optional[str] = None,
                               exclude_conn: int = -1):
-        """Propagate a backend addition from one connection's ctl to all others."""
-        self.backends[name] = (host, port)
+        """
+        Propagate a backend addition from one connection's ctl to all
+        others. The token (if any) is stored in the canonical 3-tuple
+        and passed to every peer connection so subsequent lazy connects
+        will Tauth.
+        """
+        self.backends[name] = (host, port, token)
         for cid, conn in self._connections.items():
             if cid != exclude_conn:
-                conn.add_backend(name, host, port)
-        logger.info(f"Propagated add '{name}' → {host}:{port} "
-                     f"to {len(self._connections) - 1} other connections")
+                conn.add_backend(name, host, port, token=token)
+        logger.info(
+            f"Propagated add '{name}' → {host}:{port}"
+            f"{' +auth' if token else ''} "
+            f"to {max(len(self._connections) - 1, 0)} other connections"
+        )
         
         # Notify LLM backends about the new machine
         await self._notify_llm_backends_machine_add(name)
@@ -160,8 +217,10 @@ class MuxServer:
         for cid, conn in self._connections.items():
             if cid != exclude_conn:
                 await conn.remove_backend(name)
-        logger.info(f"Propagated remove '{name}' "
-                     f"to {len(self._connections) - 1} other connections")
+        logger.info(
+            f"Propagated remove '{name}' "
+            f"to {max(len(self._connections) - 1, 0)} other connections"
+        )
     
     # ── LLM backend machine notifications ───────────────────────
     
@@ -213,7 +272,7 @@ class MuxServer:
         if backend_name not in self.backends:
             return
         
-        host, port = self.backends[backend_name]
+        host, port, token = self.backends[backend_name]
         
         try:
             from .backend import BackendConnection
@@ -226,6 +285,7 @@ class MuxServer:
                 host=host,
                 port=port,
                 response_callback=_noop,
+                auth_token=token,
             )
             
             if not await conn.connect():
@@ -366,6 +426,7 @@ class MuxServer:
             backend_configs=self.backends,
             reader=reader,
             writer=writer,
+            auth_manager=self._auth_manager,
         )
         
         # Wire ctl callbacks so writes to /n/ctl propagate to all connections

@@ -43,6 +43,7 @@ import time
 from typing import Dict, Optional, Tuple, List
 
 from . import wire
+from .auth import AuthManager, AuthContext
 from .backend import BackendConnection
 
 logger = logging.getLogger("riomux.mux")
@@ -51,6 +52,45 @@ logger = logging.getLogger("riomux.mux")
 MUX_ROOT = "__mux_root__"
 MUX_BACKEND_DIR = "__mux_backend_dir__"  # fid pointing to a backend's root (virtual)
 MUX_CTL = "__mux_ctl__"  # fid pointing to the ctl file
+MUX_AUTH = "__mux_auth__"  # fid used for Tauth authentication
+
+
+def _normalize_backend_cfg(cfg) -> Tuple[str, int, Optional[str]]:
+    """
+    Accept either (host, port) or (host, port, token) and return the
+    canonical 3-tuple form (host, port, token_or_None).
+    """
+    if len(cfg) == 2:
+        host, port = cfg
+        return (host, int(port), None)
+    if len(cfg) == 3:
+        host, port, token = cfg
+        return (host, int(port), token if token else None)
+    raise ValueError(
+        f"Backend config must be (host, port) or (host, port, token), got {cfg!r}"
+    )
+
+
+def _load_token_from_file(path: str) -> Tuple[Optional[str], Optional[str]]:
+    """
+    Read a token from a file (first non-empty, non-comment line).
+    
+    Returns (token, error_message). Exactly one of the two is non-None.
+    Used by the /n/ctl 'token=@<path>' form.
+    """
+    try:
+        with open(path, 'r') as f:
+            for line in f:
+                line = line.strip()
+                if line and not line.startswith('#'):
+                    return (line, None)
+        return (None, f"no token found in '{path}'")
+    except FileNotFoundError:
+        return (None, f"token file not found: '{path}'")
+    except PermissionError:
+        return (None, f"permission denied reading '{path}'")
+    except Exception as e:
+        return (None, f"error reading '{path}': {e}")
 
 
 class FidInfo:
@@ -87,15 +127,24 @@ class MuxConnection:
     def __init__(
         self,
         conn_id: int,
-        backend_configs: Dict[str, Tuple[str, int]],  # name → (host, port)
+        backend_configs: Dict[str, Tuple],  # name → (host, port) or (host, port, token)
         reader: asyncio.StreamReader,
         writer: asyncio.StreamWriter,
+        auth_manager: AuthManager = None,
     ):
         self.conn_id = conn_id
-        self._backend_configs = dict(backend_configs)  # mutable copy
+        # Normalize: accept (host, port) for backward compat with callers
+        # that haven't been updated, store everything internally as
+        # (host, port, token_or_None).
+        self._backend_configs: Dict[str, Tuple[str, int, Optional[str]]] = {}
+        for n, cfg in backend_configs.items():
+            self._backend_configs[n] = _normalize_backend_cfg(cfg)
         self._reader = reader
         self._writer = writer
         self._closed = False
+        
+        # Auth context for this connection
+        self._auth = AuthContext(auth_manager or AuthManager())
         
         # Negotiated msize
         self._msize = 8192
@@ -122,6 +171,9 @@ class MuxConnection:
         # Ctl file qid path
         self._ctl_qid_path = _base + 1
         
+        # Auth fid qid path counter
+        self._next_auth_qid = _base + 900  # high range to avoid collisions
+        
         # Per-backend virtual dir qid paths (counter starts at 2)
         self._next_backend_qid = _base + 2
         self._backend_qid_paths: Dict[str, int] = {}
@@ -140,15 +192,22 @@ class MuxConnection:
     
     # ── Dynamic backend management (called from server) ─────────
     
-    def add_backend(self, name: str, host: str, port: int):
+    def add_backend(self, name: str, host: str, port: int,
+                    token: Optional[str] = None):
         """
         Add a backend to this connection's config.
         New walks will find it; existing fids are unaffected.
+        
+        If token is set, the per-client BackendConnection to this
+        backend will Tauth with that token before Tattach.
         """
-        self._backend_configs[name] = (host, port)
+        self._backend_configs[name] = (host, port, token)
         self._backend_qid_paths[name] = self._next_backend_qid
         self._next_backend_qid += 1
-        logger.info(f"[{self.conn_id}] Backend '{name}' added ({host}:{port})")
+        logger.info(
+            f"[{self.conn_id}] Backend '{name}' added ({host}:{port}"
+            f"{' +auth' if token else ''})"
+        )
     
     async def remove_backend(self, name: str):
         """
@@ -171,9 +230,16 @@ class MuxConnection:
         Process a ctl command. Returns a status message.
         
         Commands:
-            add <name> <host>:<port>    — add a backend
-            remove <name>               — remove a backend
-            (empty / whitespace)        — ignored
+            add <name> <host>:<port>                    — add a backend
+            add <name> <host>:<port> token=<token>      — with raw token
+            add <name> <host>:<port> token=@<path>      — token read from file
+            add <name> <host>:<port>:<token>            — colon form (legacy-ish)
+            remove <name>                               — remove a backend
+            (empty / whitespace)                        — ignored
+        
+        The token is held in memory only; it is NEVER echoed back in the
+        ctl listing (cat /n/ctl shows only "(auth)" as a marker) and is
+        never logged in plaintext.
         """
         command = command.strip()
         if not command:
@@ -182,31 +248,71 @@ class MuxConnection:
         parts = command.split()
         verb = parts[0].lower()
         
-        if verb == "add" and len(parts) == 3:
+        if verb == "add" and len(parts) >= 3:
             name = parts[1]
             addr = parts[2]
+            
+            # Optional trailing kwargs (only token= is recognized today).
+            token: Optional[str] = None
+            for extra in parts[3:]:
+                if extra.startswith("token="):
+                    raw = extra[len("token="):]
+                    if raw.startswith("@"):
+                        # token=@<path>: read first non-comment line from file
+                        path = raw[1:]
+                        loaded, err = _load_token_from_file(path)
+                        if err:
+                            return f"error: {err}\n"
+                        token = loaded
+                    else:
+                        token = raw
+                else:
+                    return (f"error: unknown option '{extra}'. "
+                            f"Supported: token=<value> | token=@<path>\n")
             
             if ':' not in addr:
                 return f"error: invalid address '{addr}', expected host:port\n"
             
-            host, port_str = addr.rsplit(':', 1)
+            # Parse address. Accept either host:port OR host:port:token
+            # (colon form). To disambiguate "host" containing colons
+            # (IPv6 literals), we rely on a rsplit and a port-looks-like-int
+            # check: if rsplit(':', 1) leaves a numeric tail, it's the port;
+            # otherwise it's a token suffix and we rsplit once more.
+            host, last = addr.rsplit(':', 1)
             try:
-                port = int(port_str)
+                port = int(last)
             except ValueError:
-                return f"error: invalid port '{port_str}'\n"
+                # last is not a port — treat as colon-form token suffix
+                if ':' not in host:
+                    return f"error: invalid address '{addr}', expected host:port\n"
+                colon_token = last
+                host, port_str = host.rsplit(':', 1)
+                try:
+                    port = int(port_str)
+                except ValueError:
+                    return f"error: invalid port '{port_str}'\n"
+                # token= kwarg wins over colon-form if both are given
+                if token is None:
+                    token = colon_token
             
             if name in self._backend_configs:
                 return f"error: backend '{name}' already exists\n"
             
-            # Add locally
-            self.add_backend(name, host, port)
+            # Add locally (token kept in memory, never echoed/logged plaintext).
+            self.add_backend(name, host, port, token=token)
             
             # Notify server to propagate to other connections
             if self._on_backend_add:
-                await self._on_backend_add(name, host, port, exclude_conn=self.conn_id)
+                await self._on_backend_add(
+                    name, host, port, token, exclude_conn=self.conn_id
+                )
             
-            logger.info(f"[{self.conn_id}] ctl: added backend '{name}' → {host}:{port}")
-            return f"added {name} {host}:{port}\n"
+            tag_str = " +auth" if token else ""
+            logger.info(
+                f"[{self.conn_id}] ctl: added backend '{name}' → "
+                f"{host}:{port}{tag_str}"
+            )
+            return f"added {name} {host}:{port}{tag_str}\n"
         
         elif verb == "remove" and len(parts) == 2:
             name = parts[1]
@@ -224,8 +330,13 @@ class MuxConnection:
             return f"removed {name}\n"
         
         else:
-            return (f"error: unknown command '{command}'\n"
-                    f"usage: add <name> <host>:<port> | remove <name>\n")
+            return (
+                f"error: unknown command '{command}'\n"
+                f"usage:\n"
+                f"  add <name> <host>:<port> [token=<tok>|token=@<path>]\n"
+                f"  add <name> <host>:<port>:<token>\n"
+                f"  remove <name>\n"
+            )
     
     async def serve(self):
         """Main client read loop."""
@@ -307,9 +418,44 @@ class MuxConnection:
     # ── Auth ─────────────────────────────────────────────────────
     
     async def _handle_auth(self, data: bytes, tag: int):
-        """Auth not required."""
+        """
+        Handle Tauth — create an auth fid for token exchange.
+        
+        If auth is disabled (no secrets configured), returns Rerror
+        ("authentication not required") — this is the standard 9P
+        response and signals the client to proceed with Tattach using
+        NOFID for afid.
+        
+        If auth is enabled, creates an auth fid that the client can
+        write a token to. The client then references this afid in
+        Tattach.
+        
+        Tauth wire format: size[4] type[1] tag[2] afid[4] uname[s] aname[s]
+        Note: only ONE fid (afid), unlike Tattach which has fid + afid.
+        """
+        if not self._auth.auth_required:
+            await self._send_client(
+                wire.build_rerror(tag, "authentication not required")
+            )
+            return
+        
+        afid, uname, aname = wire.parse_tauth(data)
+        
+        # Create auth fid
+        auth_fid = self._auth.handle_tauth(afid, uname, aname)
+        
+        # Register the fid in our fid table
+        aqid_path = self._next_auth_qid
+        self._next_auth_qid += 1
+        self._fids[afid] = FidInfo(kind=MUX_AUTH, path="/auth")
+        
+        logger.info(f"[{self.conn_id}] Tauth: user='{uname}' afid={afid}")
+        
+        # Return Rauth with a qid for the auth fid
+        # qid type QTAUTH=0x08 per 9P2000 spec
+        QTAUTH = 0x08
         await self._send_client(
-            wire.build_rerror(tag, "Authentication not required")
+            wire.build_rattach(tag, QTAUTH, 0, aqid_path)
         )
     
     # ── Attach ───────────────────────────────────────────────────
@@ -318,10 +464,24 @@ class MuxConnection:
         """
         Attach — the client's fid becomes the virtual mux root.
         
+        If auth is enabled, checks that the afid references a valid,
+        authenticated AuthFid before allowing the attach.
+        
         If aname is a backend name, attach directly to that backend
         (for clients that want to skip the virtual root).
         """
         fid, afid, uname, aname = wire.parse_tattach(data)
+        
+        # ── Auth check ──────────────────────────────────────
+        auth_err = self._auth.check_attach(afid, uname)
+        if auth_err:
+            logger.warning(
+                f"[{self.conn_id}] Attach denied for user '{uname}': {auth_err}"
+            )
+            await self._send_client(wire.build_rerror(tag, auth_err))
+            return
+        
+        logger.info(f"[{self.conn_id}] Attach: user='{uname}' fid={fid} afid={afid}")
         
         if aname and aname in self._backend_configs:
             # Direct attach to a specific backend
@@ -603,6 +763,11 @@ class MuxConnection:
             await self._send_client(wire.build_rclunk(tag))
             return
         
+        if info.kind == MUX_AUTH:
+            self._auth.handle_auth_clunk(fid)
+            await self._send_client(wire.build_rclunk(tag))
+            return
+        
         if info.kind == MUX_CTL:
             # Process accumulated writes on clunk (Plan 9 idiom)
             if info.ctl_write_buf:
@@ -662,6 +827,52 @@ class MuxConnection:
             return
         
         info = self._fids[fid]
+        
+        # ── Handle auth fid operations locally ─────────────
+        if info.kind == MUX_AUTH:
+            if mtype == wire.TOPEN:
+                QTAUTH = 0x08
+                aqid_path = self._next_auth_qid - 1  # last assigned
+                await self._send_client(
+                    wire.build_ropen(tag, QTAUTH, 0, aqid_path,
+                                     self._msize - 24)
+                )
+            elif mtype == wire.TWRITE:
+                # Client writes token to auth fid
+                write_count = struct.unpack_from('<I', data, 19)[0]
+                write_data = data[23:23 + write_count]
+                try:
+                    self._auth.handle_auth_write(fid, write_data)
+                except ValueError as e:
+                    await self._send_client(wire.build_rerror(tag, str(e)))
+                    return
+                # Respond with Rwrite
+                body = bytearray()
+                body += struct.pack('<IBH', 0, wire.RWRITE, tag)
+                body += struct.pack('<I', write_count)
+                struct.pack_into('<I', body, 0, len(body))
+                await self._send_client(bytes(body))
+            elif mtype == wire.TREAD:
+                # Client reads auth status
+                offset = struct.unpack_from('<Q', data, 11)[0]
+                count = struct.unpack_from('<I', data, 19)[0]
+                try:
+                    result = self._auth.handle_auth_read(fid, offset, count)
+                except ValueError as e:
+                    await self._send_client(wire.build_rerror(tag, str(e)))
+                    return
+                await self._send_client(wire.build_rread_dir(tag, result))
+            elif mtype == wire.TSTAT:
+                stat_data = wire.pack_stat(
+                    "auth", self._next_auth_qid - 1,
+                    is_dir=False, length=0
+                )
+                await self._send_client(wire.build_rstat(tag, stat_data))
+            else:
+                await self._send_client(
+                    wire.build_rerror(tag, "Operation not supported on auth fid")
+                )
+            return
         
         # ── Handle ctl file operations locally ──────────────
         if info.kind == MUX_CTL:
@@ -744,11 +955,16 @@ class MuxConnection:
     # ── Ctl file read/write ─────────────────────────────────────
     
     def _format_ctl_listing(self) -> bytes:
-        """Format the ctl file content: list of current backends."""
+        """
+        Format the ctl file content: list of current backends.
+        Tokens are NEVER echoed back — only an '(auth)' marker indicates
+        a backend is configured with a token.
+        """
         lines = []
         for name in sorted(self._backend_configs.keys()):
-            host, port = self._backend_configs[name]
-            lines.append(f"{name} {host}:{port}")
+            host, port, token = self._backend_configs[name]
+            tag = " (auth)" if token else ""
+            lines.append(f"{name} {host}:{port}{tag}")
         return ('\n'.join(lines) + '\n').encode('utf-8') if lines else b''
     
     async def _handle_ctl_read(self, data: bytes, tag: int):
@@ -967,13 +1183,14 @@ class MuxConnection:
         if name not in self._backend_configs:
             return None
         
-        host, port = self._backend_configs[name]
+        host, port, token = self._backend_configs[name]
         
         backend = BackendConnection(
             name=name,
             host=host,
             port=port,
             response_callback=self._send_client,
+            auth_token=token,
         )
         
         if await backend.connect():
@@ -1011,3 +1228,4 @@ class MuxConnection:
         self._backends.clear()
         self._fids.clear()
         self._tag_routes.clear()
+        self._auth.cleanup()

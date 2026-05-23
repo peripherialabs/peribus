@@ -209,6 +209,29 @@ def build_twalk(tag: int, fid: int, newfid: int, names: list) -> bytes:
 
 # ── Tattach parsing ─────────────────────────────────────────────
 
+def parse_tauth(data: bytes) -> Tuple[int, str, str]:
+    """
+    Parse Tauth: afid[4] uname[s] aname[s]
+    Returns (afid, uname, aname)
+    
+    Note: Tauth has only ONE fid field (the afid to create),
+    unlike Tattach which has fid[4] afid[4].
+    """
+    afid = struct.unpack_from('<I', data, 7)[0]
+    
+    offset = 11
+    uname_len = struct.unpack_from('<H', data, offset)[0]
+    offset += 2
+    uname = data[offset:offset + uname_len].decode('utf-8')
+    offset += uname_len
+    
+    aname_len = struct.unpack_from('<H', data, offset)[0]
+    offset += 2
+    aname = data[offset:offset + aname_len].decode('utf-8')
+    
+    return afid, uname, aname
+
+
 def parse_tattach(data: bytes) -> Tuple[int, int, str, str]:
     """
     Parse Tattach: fid[4] afid[4] uname[s] aname[s]
