@@ -71,8 +71,25 @@ class Codec:
                     self._pack_str(msg.uname) +
                     self._pack_str(msg.aname))
         
+        elif isinstance(msg, Tauth):
+            # Tauth: afid[4] uname[s] aname[s]. Like Tattach but with
+            # only the afid (no fid). Symmetric with the existing
+            # decoder branch for MsgType.Tauth.
+            return (struct.pack('<I', msg.afid) +
+                    self._pack_str(msg.uname) +
+                    self._pack_str(msg.aname))
+        
         elif isinstance(msg, Rattach):
             return msg.qid.pack()
+        
+        elif isinstance(msg, Rauth):
+            # Rauth wire format: aqid[13] — identical layout to Rattach
+            # (both carry a single Qid). Without this branch, the server
+            # cannot complete a Tauth handshake and the codec raises
+            # "Cannot encode message type" — visible as a silent socket
+            # drop on the wire because the error happens after the write
+            # path has already failed.
+            return msg.aqid.pack()
         
         elif isinstance(msg, Rerror):
             return self._pack_str(msg.ename)
@@ -173,6 +190,11 @@ class Codec:
         elif msg_type == MsgType.Rattach:
             qid = Qid.unpack(body[:13])
             return Rattach(tag, qid)
+        
+        elif msg_type == MsgType.Rauth:
+            # Rauth: aqid[13]. Symmetric with the encoder branch above.
+            aqid = Qid.unpack(body[:13])
+            return Rauth(tag, aqid)
         
         elif msg_type == MsgType.Rerror:
             ename, _ = self._unpack_str(body, 0)
@@ -295,3 +317,4 @@ class Codec:
         slen = struct.unpack('<H', data[pos:pos+2])[0]
         s = data[pos+2:pos+2+slen].decode('utf-8')
         return s, pos + 2 + slen
+        

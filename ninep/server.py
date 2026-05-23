@@ -35,10 +35,16 @@ from .protocol import (
     Twstat, Rwstat,
 )
 from .codec import Codec
+from .auth import AuthManager, AuthContext
 from core.files import SyntheticFile, SyntheticDir
-from core.types import FidState
+from core.types import FidState, Qid
 
 logger = logging.getLogger(__name__)
+
+
+# Qid path for the (per-connection) auth fid. The 9P2000 spec
+# requires aqid to have QTAUTH (0x08) set; everything else is opaque.
+_QTAUTH = 0x08
 
 
 class Server9P:
@@ -47,15 +53,26 @@ class Server9P:
     
     Serves a synthetic filesystem tree over TCP or Unix sockets.
     Handles multiple concurrent client connections.
+    
+    Optionally enforces token-based 9P authentication. When an
+    AuthManager with at least one secret is provided, clients must
+    Tauth + write a valid token before Tattach is accepted.
     """
     
-    def __init__(self, root: SyntheticDir, msize: int = 65536):
+    def __init__(
+        self,
+        root: SyntheticDir,
+        msize: int = 65536,
+        auth_manager: Optional[AuthManager] = None,
+    ):
         """
         Initialize server.
         
         Args:
-            root: Root directory of the filesystem to serve
-            msize: Maximum message size
+            root:         Root directory of the filesystem to serve
+            msize:        Maximum message size
+            auth_manager: Optional AuthManager. If None or has no secrets,
+                          auth is disabled (backward compatible).
         """
         self.root = root
         self.msize = msize
@@ -63,6 +80,7 @@ class Server9P:
         self.connections: Dict[int, 'Connection9P'] = {}
         self._conn_id = 0
         self._server = None
+        self._auth_manager = auth_manager or AuthManager()
     
     async def serve_tcp(self, host: str = '0.0.0.0', port: int = 5640):
         """
@@ -109,10 +127,47 @@ class Server9P:
             await self._server.serve_forever()
     
     async def stop(self):
-        """Stop the server"""
-        if self._server:
-            self._server.close()
+        """
+        Stop the server cleanly.
+
+        Closes the listening socket AND every active client connection.
+
+        Closing only the listening socket (the previous behaviour) leaves
+        every existing client stuck in `reader.read()` forever — which is
+        why Ctrl-C used to take ~2 minutes: the FUSE mount and any peer
+        muxes kept their fids open, the serve_forever future never woke
+        up, and we waited for kernel-level socket timeouts to clean it up.
+
+        Now we:
+          1. Close the listener so no new clients arrive.
+          2. Mark every Connection9P closed and close its writer, which
+             unblocks the reader.read() in serve() with EOF.
+          3. Wait for the listener to fully shut down.
+        """
+        if self._server is None:
+            return
+
+        # 1. Stop accepting new connections.
+        self._server.close()
+
+        # 2. Kick every active connection. Snapshot the dict because
+        #    Connection9P.serve()'s finally clause mutates it on exit.
+        for conn in list(self.connections.values()):
+            conn._closed = True
+            # Cancel any in-flight per-message tasks so they don't try
+            # to write to a closing socket.
+            for task in list(conn.pending.values()):
+                task.cancel()
+            try:
+                conn.writer.close()
+            except Exception:
+                pass
+
+        # 3. Now wait for the listener.
+        try:
             await self._server.wait_closed()
+        except Exception:
+            pass
     
     async def _handle_connection(
         self,
@@ -126,7 +181,10 @@ class Server9P:
         peer = writer.get_extra_info('peername')
         logger.info(f"New connection {conn_id} from {peer}")
         
-        conn = Connection9P(conn_id, self.root, self.codec, reader, writer)
+        conn = Connection9P(
+            conn_id, self.root, self.codec, reader, writer,
+            auth_manager=self._auth_manager,
+        )
         self.connections[conn_id] = conn
         
         try:
@@ -135,8 +193,11 @@ class Server9P:
             logger.error(f"Connection {conn_id} error: {e}", exc_info=True)
         finally:
             logger.info(f"Connection {conn_id} closed")
-            del self.connections[conn_id]
-            writer.close()
+            self.connections.pop(conn_id, None)
+            try:
+                writer.close()
+            except Exception:
+                pass
             try:
                 await writer.wait_closed()
             except Exception:
@@ -156,7 +217,8 @@ class Connection9P:
         root: SyntheticDir,
         codec: Codec,
         reader: asyncio.StreamReader,
-        writer: asyncio.StreamWriter
+        writer: asyncio.StreamWriter,
+        auth_manager: Optional[AuthManager] = None,
     ):
         self.conn_id = conn_id
         self.root = root
@@ -168,6 +230,17 @@ class Connection9P:
         self.pending: Dict[int, asyncio.Task] = {}  # tag -> task
         self._closed = False
         self._write_lock = asyncio.Lock()  # Serialize wire writes
+        
+        # Per-connection auth state. If auth_manager has no secrets,
+        # AuthContext.check_attach() will allow everything.
+        self._auth = AuthContext(auth_manager or AuthManager())
+        
+        # Counter for generating unique aqid paths on this connection.
+        # Real-file qids come from the SyntheticFile tree; auth qids
+        # must not collide with those, so we put them in a high range.
+        # Keep the value within uint64 (the 9P qid path field is 8 bytes).
+        self._next_auth_qid_path = (0xF000_0000_0000_0000
+                                     | ((conn_id & 0xFFFFFFFF) << 16))
     
     async def serve(self):
         """
@@ -382,19 +455,67 @@ class Connection9P:
         
         # Clear any existing state on version
         self.fids.clear()
+        self._auth.cleanup()
         
         logger.debug(f"Version negotiated: msize={self.msize}, version={version}")
         
         return Rversion(tag=msg.tag, msize=self.msize, version=version)
     
-    async def _handle_auth(self, msg: Tauth) -> Rerror:
-        """Handle authentication - we don't support it"""
-        return Rerror(tag=msg.tag, ename="Authentication not required")
+    async def _handle_auth(self, msg: Tauth) -> Union[Rauth, Rerror]:
+        """
+        Handle 9P authentication request.
+        
+        If auth is disabled (no secrets), reject as before — clients
+        that don't support auth will then proceed to Tattach with
+        afid=NOFID, which check_attach() also allows when auth is off.
+        
+        If auth is enabled, create an AuthFid bound to msg.afid and
+        return Rauth with a synthetic aqid that has QTAUTH set.
+        """
+        if not self._auth.auth_required:
+            return Rerror(tag=msg.tag, ename="Authentication not required")
+        
+        if msg.afid in self.fids:
+            return Rerror(tag=msg.tag, ename="Fid already in use")
+        
+        if self._auth.is_auth_fid(msg.afid):
+            return Rerror(tag=msg.tag, ename="Auth fid already exists")
+        
+        self._auth.handle_tauth(msg.afid, msg.uname, msg.aname)
+        
+        # Build a synthetic aqid. Path must be unique per auth fid
+        # within this connection so 9P clients can use it as an inode key.
+        # We build the wire bytes directly and unpack via Qid to avoid
+        # depending on the dataclass field names of core.types.Qid.
+        self._next_auth_qid_path += 1
+        aqid_bytes = struct.pack(
+            '<BIQ', _QTAUTH, 0, self._next_auth_qid_path & 0xFFFFFFFFFFFFFFFF
+        )
+        aqid = Qid.unpack(aqid_bytes)
+        
+        logger.info(
+            f"Auth: afid={msg.afid} uname='{msg.uname}' aname='{msg.aname}' "
+            f"(conn={self.conn_id})"
+        )
+        return Rauth(tag=msg.tag, aqid=aqid)
     
     async def _handle_attach(self, msg: Tattach) -> Union[Rattach, Rerror]:
-        """Handle attach (mount root)"""
+        """Handle attach (mount root) — gated on auth when enabled."""
         if msg.fid in self.fids:
             return Rerror(tag=msg.tag, ename="Fid already in use")
+        
+        # Refuse to overwrite an active auth fid.
+        if self._auth.is_auth_fid(msg.fid):
+            return Rerror(tag=msg.tag, ename="Fid in use as auth fid")
+        
+        # Enforce auth policy.
+        auth_err = self._auth.check_attach(msg.afid, msg.uname)
+        if auth_err is not None:
+            logger.warning(
+                f"Attach denied: fid={msg.fid} uname='{msg.uname}' "
+                f"afid={msg.afid}: {auth_err}"
+            )
+            return Rerror(tag=msg.tag, ename=auth_err)
         
         qid = self.root.qid
         
@@ -527,6 +648,17 @@ class Connection9P:
     
     async def _handle_read(self, msg: Tread) -> Union[Rread, Rerror]:
         """Handle file read — with proper directory stat packing."""
+        # Auth fids are not regular fids — they live in self._auth and
+        # are read/written directly per the 9P2000 spec (no Topen).
+        if self._auth.is_auth_fid(msg.fid):
+            try:
+                count = min(msg.count, self.msize - 24)
+                data = self._auth.handle_auth_read(msg.fid, msg.offset, count)
+                return Rread(tag=msg.tag, data=data)
+            except Exception as e:
+                logger.exception(f"Auth read error on fid {msg.fid}: {e}")
+                return Rerror(tag=msg.tag, ename=str(e))
+        
         if msg.fid not in self.fids:
             return Rerror(tag=msg.tag, ename="Unknown fid")
         
@@ -684,6 +816,16 @@ class Connection9P:
         """Handle file write"""
         logger.info(f"Write request: fid={msg.fid}, offset={msg.offset}, len={len(msg.data)}")
         
+        # Auth fids accept writes directly (no Topen), the AuthContext
+        # state machine consumes them and triggers token validation.
+        if self._auth.is_auth_fid(msg.fid):
+            try:
+                count = self._auth.handle_auth_write(msg.fid, msg.data)
+                return Rwrite(tag=msg.tag, count=count)
+            except Exception as e:
+                logger.exception(f"Auth write error on fid {msg.fid}: {e}")
+                return Rerror(tag=msg.tag, ename=str(e))
+        
         if msg.fid not in self.fids:
             logger.error(f"Write failed: Unknown fid {msg.fid}")
             return Rerror(tag=msg.tag, ename="Unknown fid")
@@ -710,6 +852,13 @@ class Connection9P:
             
     async def _handle_clunk(self, msg: Tclunk) -> Union[Rclunk, Rerror]:
         """Handle fid close"""
+        # Auth fids are clunked through the auth context so we can
+        # promote a successful auth into a connection-scoped session.
+        if self._auth.is_auth_fid(msg.fid):
+            self._auth.handle_auth_clunk(msg.fid)
+            logger.debug(f"Clunk auth fid {msg.fid}")
+            return Rclunk(tag=msg.tag)
+        
         if msg.fid not in self.fids:
             return Rerror(tag=msg.tag, ename="Unknown fid")
         
