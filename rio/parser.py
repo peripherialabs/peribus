@@ -7,6 +7,26 @@ into the version system.
 
 No force_sync(), no blind scene sweeping. The parser explicitly registers
 every object it creates.
+
+Signals
+-------
+The execution namespace exposes:
+
+  - `Signal`        — PySide6.QtCore.Signal, unchanged. Local only.
+  - `RemoteSignal`  — rio's cross-machine Signal. Drop-in for
+                      PySide6.Signal in shape (`connect`/`emit`/
+                      `disconnect`), but also crosses to subscribed
+                      peers via UDP.
+  - `subscribe(name)` / `unsubscribe(name)` — peer subscriptions.
+
+`RemoteSignal(...)` works as both a free-standing object — e.g.
+`text_spoken = RemoteSignal(str)` at module level — AND as a class
+attribute on a QObject subclass. The variable / attribute name
+becomes the network name automatically after each parse cycle.
+
+After every successful `Executor.execute(...)`, we hand the namespace
+to `bus.adopt_namespace(...)` so any anonymous `RemoteSignal(...)`
+instances get named and become reachable on the network.
 """
 
 import sys
@@ -102,7 +122,39 @@ class ExecutionContext:
             self._namespace['QPointF'] = QtCore.QPointF
             self._namespace['QSize'] = QtCore.QSize
             self._namespace['QSizeF'] = QtCore.QSizeF
+            # `Signal` here stays as PySide6's regular Signal — same
+            # binding rio user code has always had, with all its
+            # Qt-native semantics (per-instance class-attribute
+            # signals, overloaded signatures, the works).
+            #
+            # The cross-machine version is exposed under
+            # `RemoteSignal`. Side-by-side, the names tell the story:
+            #
+            #     local = Signal(str)         # PySide6, local only
+            #     shared = RemoteSignal(str)  # crosses subscribed peers
+            #
+            # We deliberately don't override `Signal` anymore — too
+            # easy to accidentally network something you only wanted
+            # local. Opt-in by writing `RemoteSignal` explicitly.
             self._namespace['Signal'] = QtCore.Signal
+            try:
+                from rio.signals import (
+                    Signal as _RioSignal,
+                    subscribe as _rio_subscribe,
+                    unsubscribe as _rio_unsubscribe,
+                )
+                self._namespace['RemoteSignal'] = _RioSignal
+                self._namespace['subscribe'] = _rio_subscribe
+                self._namespace['unsubscribe'] = _rio_unsubscribe
+            except ImportError:
+                # rio.signals not available — stub out so user code
+                # mentioning these names doesn't crash with NameError.
+                # `RemoteSignal` falls back to PySide6.Signal so
+                # existing class-attribute uses keep working in a
+                # degraded "local only" mode.
+                self._namespace['RemoteSignal'] = QtCore.Signal
+                self._namespace['subscribe'] = lambda *a, **kw: False
+                self._namespace['unsubscribe'] = lambda *a, **kw: False
             self._namespace['Slot'] = QtCore.Slot
 
             self._namespace['QColor'] = QtGui.QColor
@@ -338,6 +390,24 @@ class Executor:
             self._annotate_with_variable_names(new_widgets, new_items, namespace)
             self._annotate_all_items(namespace)
 
+            # Hand the namespace to the signal bus so any anonymous
+            # cross-machine `Signal(...)` instances get their variable
+            # or attribute name bound. Cheap (no-ops if the bus isn't
+            # running or the anonymous pool is empty); covers every
+            # caller of Executor.execute — ParseFile, QuickFile,
+            # StateFile's replay path, all of them.
+            try:
+                from rio.signals import _global_bus
+                _bus = _global_bus()
+                if _bus is not None:
+                    _bus.adopt_namespace(namespace)
+            except Exception:
+                # Don't let signal-side issues mask user-code success.
+                # The exec already ran; users will still see the
+                # `text_spoken` Signal locally, just without its name
+                # on the wire.
+                traceback.print_exc()
+
             if new_items:
                 print(f"Registered {len(new_items)} new parsed item(s): {new_items}")
             if new_widgets:
@@ -426,9 +496,11 @@ class Executor:
             'json', 'os', 'sys', 'np', 'numpy', 'pd', 'pandas',
             'math', 'sin', 'cos', 'tan', 'sqrt', 'pi', 'e',
             'Qt', 'QTimer', 'QRect', 'QRectF', 'QPoint', 'QPointF',
-            'QSize', 'QSizeF', 'Signal', 'Slot',
+            'QSize', 'QSizeF', 'Signal', 'Slot', 'RemoteSignal',
             'QColor', 'QBrush', 'QPen', 'QFont', 'QPixmap',
             'QImage', 'QPainter', 'QWebEngineView',
+            # rio.signals injection
+            'subscribe', 'unsubscribe',
         }
 
         for varname, obj in namespace.items():

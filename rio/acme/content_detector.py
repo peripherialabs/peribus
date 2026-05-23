@@ -3,7 +3,69 @@ Content type detection for determining how to display files
 """
 
 import os
+import re
 import mimetypes
+
+
+# URL detection: explicit scheme (http/https/file/ftp), or a www.* host,
+# or a bare domain.tld[/path] with at least one dot.  Kept conservative
+# so plain words like "foo" aren't mistaken for URLs.
+_URL_SCHEME_RE = re.compile(r'^(https?|file|ftp)://', re.IGNORECASE)
+_URL_WWW_RE = re.compile(r'^www\.[^\s/]+', re.IGNORECASE)
+# bare host like example.com or sub.example.co.uk, optionally followed by /path
+_URL_BARE_RE = re.compile(
+    r'^(?!\d+\.\d+\.\d+\.\d+$)'              # not a pure IPv4 (handled by scheme case)
+    r'[a-zA-Z0-9](?:[a-zA-Z0-9-]*[a-zA-Z0-9])?'
+    r'(?:\.[a-zA-Z0-9](?:[a-zA-Z0-9-]*[a-zA-Z0-9])?)+'
+    r'(?:/[^\s]*)?$'
+)
+# Common TLDs that justify treating a bare domain as a URL.  This is a
+# heuristic — files like "foo.bar" with arbitrary extensions should NOT
+# be treated as URLs.
+_COMMON_TLDS = {
+    'com', 'org', 'net', 'edu', 'gov', 'io', 'co', 'ai', 'app', 'dev',
+    'me', 'info', 'biz', 'us', 'uk', 'de', 'fr', 'jp', 'cn', 'ru', 'br',
+    'in', 'it', 'es', 'nl', 'se', 'no', 'fi', 'dk', 'pl', 'ch', 'at',
+    'be', 'au', 'ca', 'nz', 'mx', 'ar', 'cl', 'kr', 'tw', 'hk', 'sg',
+    'tv', 'cc', 'ly', 'tech', 'xyz', 'site', 'online', 'store', 'blog',
+    'news', 'wiki', 'cloud', 'page',
+}
+
+
+def is_url(text):
+    """Return True if text looks like a URL we should open in a web view.
+    
+    Accepts:
+      - Explicit schemes: https://..., http://..., file://..., ftp://...
+      - www.* hosts: www.google.com
+      - Bare hosts ending in a common TLD: example.com, foo.io/bar
+    """
+    if not text:
+        return False
+    text = text.strip()
+    if not text or any(c.isspace() for c in text):
+        return False
+    if _URL_SCHEME_RE.match(text):
+        return True
+    if _URL_WWW_RE.match(text):
+        return True
+    if _URL_BARE_RE.match(text):
+        # Must end in a recognized TLD before any path segment
+        host = text.split('/', 1)[0]
+        tld = host.rsplit('.', 1)[-1].lower()
+        if tld in _COMMON_TLDS:
+            return True
+    return False
+
+
+def normalize_url(text):
+    """Add https:// scheme if the URL is bare or starts with www."""
+    if not text:
+        return text
+    text = text.strip()
+    if _URL_SCHEME_RE.match(text):
+        return text
+    return "https://" + text
 
 
 def _safe_probe_9p(func, path, timeout=0.4):
@@ -32,10 +94,15 @@ def _is_9p_path(path):
 def detect_content_type(path):
     """
     Detect content type of a file
-    Returns: 'directory', 'image', 'video', 'audio', '3d', 'pdf', 'text', or None
+    Returns: 'directory', 'image', 'video', 'audio', '3d', 'pdf', 'text',
+             'url', or None
     """
     if not path:
         return None
+    
+    # Check for URLs before any filesystem probing — URLs never touch the FS.
+    if is_url(path):
+        return 'url'
     
     # For 9P paths, avoid any probe that might block on synthetic files.
     # Use extension-based detection first, and timeout-protect stat calls.

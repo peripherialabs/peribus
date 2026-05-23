@@ -770,6 +770,10 @@ class Connection(QGraphicsPathItem):
         self.setFlag(QGraphicsItem.ItemIsSelectable)
         self._hovered = False
 
+        # Cache the rasterized path so we only repaint when geometry or
+        # appearance state actually changes.
+        self.setCacheMode(QGraphicsItem.DeviceCoordinateCache)
+
         # Register with ports
         source_port.connections.append(self)
         target_port.connections.append(self)
@@ -1054,13 +1058,13 @@ class BaseNode(QGraphicsRectItem):
         Safe to call multiple times (e.g. after adding terminal ports)."""
         self._layout()
 
-        # Drop shadow (only once)
-        if not self.graphicsEffect():
-            shadow = QGraphicsDropShadowEffect()
-            shadow.setBlurRadius(24)
-            shadow.setColor(Theme.NODE_SHADOW)
-            shadow.setOffset(0, 4)
-            self.setGraphicsEffect(shadow)
+        # Use a device-coordinate cache so paint() runs only when the node
+        # geometry or appearance changes, not on every viewport update.
+        # NOTE: We deliberately do NOT use QGraphicsDropShadowEffect — graphics
+        # effects defeat item caching and rasterize a much larger offscreen
+        # pixmap on every repaint, which destroys FPS once you have more than
+        # a handful of nodes. We draw a cheap static shadow inside paint().
+        self.setCacheMode(QGraphicsItem.DeviceCoordinateCache)
 
         # Precompute elided title text for paint()
         fm = QFontMetrics(Theme.FONT_NODE_TITLE)
@@ -1125,6 +1129,17 @@ class BaseNode(QGraphicsRectItem):
         else:
             super().mouseDoubleClickEvent(event)
 
+    # Margin around rect() reserved for our cheap fake drop-shadow so that
+    # the device-coord cache and dirty regions account for it.
+    _SHADOW_MARGIN = 6
+
+    def boundingRect(self):
+        # Expand the bounding rect so the fake shadow we paint below the body
+        # is not clipped and viewport invalidation tracks it correctly.
+        r = self.rect()
+        m = self._SHADOW_MARGIN
+        return r.adjusted(-m, -m, m, m + 2)
+
     def paint(self, painter, option, widget):
         painter.setRenderHint(QPainter.Antialiasing)
 
@@ -1140,6 +1155,20 @@ class BaseNode(QGraphicsRectItem):
         else:
             border_color = Theme.NODE_BORDER
             border_width = 0.75
+
+        # ── Cheap fake drop-shadow ────────────────────────────────────────
+        # Two stacked translucent rounded rects below the body. Costs ~2
+        # drawRoundedRect calls versus a full Gaussian blur per repaint.
+        shadow_color = Theme.NODE_SHADOW
+        painter.setPen(Qt.NoPen)
+        s1 = QColor(shadow_color)
+        s1.setAlpha(max(20, shadow_color.alpha() // 3))
+        painter.setBrush(QBrush(s1))
+        painter.drawRoundedRect(rect.adjusted(-2, 2, 2, 5), radius, radius)
+        s2 = QColor(shadow_color)
+        s2.setAlpha(max(12, shadow_color.alpha() // 6))
+        painter.setBrush(QBrush(s2))
+        painter.drawRoundedRect(rect.adjusted(-4, 3, 4, 7), radius, radius)
 
         # ── Body — translucent dark glass ─────────────────────────────────
         body_path = QPainterPath()
@@ -2518,26 +2547,50 @@ class OperatorGraphScene(QGraphicsScene):
         # Do NOT call super — skip the background fill entirely
         painter.setRenderHint(QPainter.Antialiasing, False)
 
+        # Skip the grid entirely when zoomed far out: dots become sub-pixel
+        # and just add noise + cost. We probe the device-pixel scale from
+        # the painter's world transform.
+        t = painter.worldTransform()
+        scale = (abs(t.m11()) + abs(t.m22())) * 0.5
+        if scale < 0.35:
+            return
+
         gs = Theme.GRID_SIZE
         major = Theme.GRID_MAJOR_EVERY
 
         left = int(rect.left()) - (int(rect.left()) % gs)
         top = int(rect.top()) - (int(rect.top()) % gs)
 
-        # Draw faint dots at intersections
-        minor_pen = QPen(Theme.GRID_DOT, 1.0)
-        major_pen = QPen(Theme.GRID_LINE_MAJOR, 1.2)
+        # Collect minor and major dots into two QPolygonFs and emit a single
+        # batched drawPoints() per pen. This is dramatically faster than the
+        # previous per-dot drawPoint() loop, which paid the Python->C++ cost
+        # thousands of times on every viewport repaint.
+        minor_pts = QPolygonF()
+        major_pts = QPolygonF()
 
+        # Pre-compute which grid x-indices are "major" along x; same for y.
+        # A point is "major" only when both indices are major (preserves the
+        # original 5x5 intersection look).
         x = left
-        while x <= rect.right():
+        right = rect.right()
+        bottom = rect.bottom()
+        while x <= right:
+            x_is_major = (int(x / gs) % major == 0)
             y = top
-            while y <= rect.bottom():
-                is_major = (int(x / gs) % major == 0 and
-                            int(y / gs) % major == 0)
-                painter.setPen(major_pen if is_major else minor_pen)
-                painter.drawPoint(QPointF(x, y))
+            while y <= bottom:
+                if x_is_major and (int(y / gs) % major == 0):
+                    major_pts.append(QPointF(x, y))
+                else:
+                    minor_pts.append(QPointF(x, y))
                 y += gs
             x += gs
+
+        if not minor_pts.isEmpty():
+            painter.setPen(QPen(Theme.GRID_DOT, 1.0))
+            painter.drawPoints(minor_pts)
+        if not major_pts.isEmpty():
+            painter.setPen(QPen(Theme.GRID_LINE_MAJOR, 1.2))
+            painter.drawPoints(major_pts)
 
     # ── Node Management ──────────────────────────────────────────────────
 
@@ -3117,53 +3170,123 @@ class OperatorGraphScene(QGraphicsScene):
         return "/n/mux/llm/agents"
 
     def _auto_layout(self):
-        """Arrange nodes: 9P services on left, agents on right, text nodes below, debug nodes further below."""
+        """Arrange nodes in a depth-aware grid.
+
+        9P service nodes are bucketed into columns by filesystem subdirectory
+        depth (shallow on the left, deep on the right). Agents form their own
+        column past the deepest 9P column — they're the consumers of the
+        filesystem so reading left-to-right gives source -> sink.
+
+        Each column packs vertically by *measured* node height so rows never
+        overlap regardless of port count, and every column is centered on a
+        shared horizontal midline so the result reads as a clean grid.
+
+        Text and debug nodes are workshop nodes; they stay in their own rows
+        below the main grid.
+        """
         ninep_list = list(self.ninep_nodes.values())
         agent_list = list(self.agent_nodes.values())
         text_list = list(self.text_nodes.values())
         debug_list = list(self.debug_nodes.values())
 
-        spacing_x = 380
-        spacing_y = 300
+        col_gutter = 80   # horizontal space between depth columns
+        row_gutter = 36   # vertical space between stacked nodes in a column
+        block_gap = 140   # vertical space before the text / debug bands
 
-        # 9P nodes in a column on the left
-        for i, node in enumerate(ninep_list):
-            x = -spacing_x
-            y = i * spacing_y - (len(ninep_list) * spacing_y) / 2
-            node.setPos(x, y)
+        def _h(node):
+            try:
+                return float(node.rect().height())
+            except Exception:
+                return 160.0
 
-        # Agent nodes in a grid on the right
+        def _w(node, fallback):
+            try:
+                return float(node.rect().width())
+            except Exception:
+                return fallback
+
+        # ── Bucket 9P nodes by depth ──────────────────────────────────────
+        # Missing depth defaults to 1 (top-level). Sort within each column
+        # by name so the layout is stable across rescans.
+        depth_buckets: Dict[int, list] = {}
+        for node in ninep_list:
+            d = int(getattr(node, '_depth', 1) or 1)
+            depth_buckets.setdefault(d, []).append(node)
+        for col_nodes in depth_buckets.values():
+            col_nodes.sort(key=lambda n: n.node_name)
+
+        # Column order: sorted depths left-to-right.
+        depths_sorted = sorted(depth_buckets.keys())
+
+        # ── Build the list of columns we'll lay out ───────────────────────
+        # Each entry: (nodes_in_column, column_label). The agents column,
+        # if non-empty, is appended at the end so it sits to the right of
+        # the deepest 9P column.
+        columns: List[list] = [depth_buckets[d] for d in depths_sorted]
         if agent_list:
-            cols = max(1, int(math.ceil(math.sqrt(len(agent_list)))))
-            for i, node in enumerate(agent_list):
-                col = i % cols
-                row = i // cols
-                x = spacing_x / 2 + col * (Theme.NODE_WIDTH + 120)
-                y = row * spacing_y - (max(1, len(agent_list) // cols) * spacing_y) / 2
-                node.setPos(x, y)
+            # Stable order across rescans.
+            columns.append(sorted(agent_list, key=lambda n: n.node_name))
 
-        # Text nodes below the agent grid
+        if not columns:
+            # Nothing to do for the main grid; fall through to text/debug.
+            agents_bottom = 0.0
+        else:
+            # Per-column stacked height (sum of node heights + gutters).
+            col_heights = []
+            col_widths = []
+            for col_nodes in columns:
+                if not col_nodes:
+                    col_heights.append(0.0)
+                    col_widths.append(Theme.NODE_WIDTH)
+                    continue
+                col_heights.append(
+                    sum(_h(n) for n in col_nodes)
+                    + row_gutter * (len(col_nodes) - 1)
+                )
+                col_widths.append(max(_w(n, Theme.NODE_WIDTH) for n in col_nodes))
+
+            tallest = max(col_heights) if col_heights else 0.0
+
+            # Center the whole grid horizontally around x=0.
+            total_w = sum(col_widths) + col_gutter * (len(columns) - 1)
+            x_cursor = -total_w / 2.0
+
+            agents_bottom = 0.0
+            for col_nodes, col_h, col_w in zip(columns, col_heights, col_widths):
+                if col_nodes:
+                    # Center this column inside the tallest column's footprint
+                    # so every column shares a common vertical midline.
+                    y = -tallest / 2.0 + (tallest - col_h) / 2.0
+                    for node in col_nodes:
+                        # Left-align nodes within their column slot. Using the
+                        # column's max width as the slot keeps narrower nodes
+                        # nicely flush.
+                        node.setPos(x_cursor, y)
+                        nh = _h(node)
+                        y += nh + row_gutter
+                        agents_bottom = max(agents_bottom, node.pos().y() + nh)
+                x_cursor += col_w + col_gutter
+
+        # ── Text nodes in their own row beneath the main grid ─────────────
+        text_bottom = agents_bottom
         if text_list:
-            agent_bottom = 0
-            if agent_list:
-                agent_bottom = max(n.pos().y() + n.rect().height()
-                                   for n in agent_list) + 80
+            tw = TextNode.TEXT_NODE_WIDTH + 60
+            total_text_w = len(text_list) * tw - 60
+            start_x = -total_text_w / 2.0
+            y = (agents_bottom + block_gap) if (ninep_list or agent_list) else 0.0
             for i, node in enumerate(text_list):
-                x = i * (TextNode.TEXT_NODE_WIDTH + 60) - (len(text_list) * (TextNode.TEXT_NODE_WIDTH + 60)) / 2
-                node.setPos(x, agent_bottom)
+                node.setPos(start_x + i * tw, y)
+                text_bottom = max(text_bottom, y + _h(node))
 
-        # Debug nodes below text nodes
+        # ── Debug nodes in their own row below text nodes ─────────────────
         if debug_list:
-            bottom_y = 0
-            if text_list:
-                bottom_y = max(n.pos().y() + n.rect().height()
-                               for n in text_list) + 80
-            elif agent_list:
-                bottom_y = max(n.pos().y() + n.rect().height()
-                               for n in agent_list) + 80
+            dw = DebugNode.DEBUG_NODE_WIDTH + 60
+            total_dw = len(debug_list) * dw - 60
+            start_x = -total_dw / 2.0
+            anchor = text_bottom if text_list else agents_bottom
+            y = (anchor + block_gap) if (text_list or ninep_list or agent_list) else 0.0
             for i, node in enumerate(debug_list):
-                x = i * (DebugNode.DEBUG_NODE_WIDTH + 60) - (len(debug_list) * (DebugNode.DEBUG_NODE_WIDTH + 60)) / 2
-                node.setPos(x, bottom_y)
+                node.setPos(start_x + i * dw, y)
 
     def _refresh_all(self):
         """Refresh all nodes."""
@@ -3172,12 +3295,29 @@ class OperatorGraphScene(QGraphicsScene):
             node._refresh_ports()
 
     def _fit_all(self):
-        """Fit all nodes in view."""
-        if self.agent_nodes or self.ninep_nodes or self.text_nodes or self.debug_nodes:
-            all_items_rect = self.itemsBoundingRect()
-            for view in self.views():
-                view.fitInView(all_items_rect.adjusted(-50, -50, 50, 50),
-                               Qt.KeepAspectRatio)
+        """Fit all nodes in view, clamped to a readable zoom range."""
+        if not (self.agent_nodes or self.ninep_nodes or self.text_nodes or self.debug_nodes):
+            return
+        all_items_rect = self.itemsBoundingRect()
+        if all_items_rect.isNull():
+            return
+        # Add a comfortable margin so nodes don't kiss the viewport edge.
+        padded = all_items_rect.adjusted(-80, -80, 80, 80)
+        for view in self.views():
+            view.fitInView(padded, Qt.KeepAspectRatio)
+            # Clamp the resulting scale to a readable range. fitInView can
+            # over-shrink when the scene is wide or over-grow when it's
+            # tiny; either way the user ends up zooming manually right
+            # after load. Pick something that always lets ports be read.
+            t = view.transform()
+            scale = (abs(t.m11()) + abs(t.m22())) * 0.5
+            MIN_FIT, MAX_FIT = 0.45, 1.10
+            if scale < MIN_FIT:
+                k = MIN_FIT / scale
+                view.scale(k, k)
+            elif scale > MAX_FIT:
+                k = MAX_FIT / scale
+                view.scale(k, k)
 
     def clear_graph(self):
         """Clear all nodes and connections from the scene only."""
@@ -3406,10 +3546,23 @@ class OperatorPanel(QWidget):
         self.view.setRenderHint(QPainter.Antialiasing)
         self.view.setRenderHint(QPainter.SmoothPixmapTransform)
         self.view.setDragMode(QGraphicsView.ScrollHandDrag)
-        self.view.setViewportUpdateMode(QGraphicsView.SmartViewportUpdate)
+        # BoundingRectViewportUpdate avoids the per-region union work that
+        # SmartViewportUpdate does on every change. With our cached items
+        # this is the right tradeoff: most updates are tiny, but when they
+        # aren't we'd rather pay one repaint than O(n) region maths.
+        self.view.setViewportUpdateMode(QGraphicsView.BoundingRectViewportUpdate)
+        # Disable the BSP item index: it's a net loss for scenes where items
+        # move frequently (every node drag would otherwise re-index every
+        # connection). NoIndex turns lookups into linear scans which are
+        # fine for the node counts this editor handles.
+        self.scene.setItemIndexMethod(QGraphicsScene.NoIndex)
         self.view.setHorizontalScrollBarPolicy(Qt.ScrollBarAlwaysOff)
         self.view.setVerticalScrollBarPolicy(Qt.ScrollBarAlwaysOff)
         self.view.setTransformationAnchor(QGraphicsView.AnchorUnderMouse)
+        self.view.setResizeAnchor(QGraphicsView.AnchorViewCenter)
+        # Forward wheel events on the view itself to our zoom handler so
+        # zoom anchors to the cursor (see _on_view_wheel below).
+        self.view.viewport().installEventFilter(self)
         self.view.setStyleSheet("QGraphicsView { border: none; background: transparent; }")
         self.view.viewport().setAutoFillBackground(False)
         self.view.setAttribute(Qt.WA_TranslucentBackground)
@@ -3872,11 +4025,12 @@ class OperatorPanel(QWidget):
             # Check if this is a known service type
             svc_def = _lookup_service(name, path)
             if svc_def is not None:
-                self.scene.add_ninep_node(
+                node = self.scene.add_ninep_node(
                     display_name, path,
                     svc_def["left_ports"], svc_def["right_ports"],
                     description=svc_def.get("description", "")
                 )
+                node._depth = depth
                 continue
 
             # Generic: create ports from files
@@ -3898,9 +4052,10 @@ class OperatorPanel(QWidget):
             # Only create the node if it has files (ports)
             # or it's a top-level directory (depth 1) even without files
             if left_ports or right_ports or depth <= 1:
-                self.scene.add_ninep_node(
+                node = self.scene.add_ninep_node(
                     display_name, path, left_ports, right_ports,
                     description=f"{path}")
+                node._depth = depth
 
     def _scan_9p_services(self):
         """Legacy shim — now handled by scan_architecture pipeline."""
@@ -4146,14 +4301,63 @@ class OperatorPanel(QWidget):
 
     # ── Zoom ─────────────────────────────────────────────────────────────
 
-    def wheelEvent(self, event):
-        """Zoom with scroll wheel."""
-        factor = 1.15
-        if event.angleDelta().y() > 0:
-            self.view.scale(factor, factor)
-        else:
-            self.view.scale(1 / factor, 1 / factor)
+    # Zoom factor per wheel notch (120 units).
+    _ZOOM_STEP = 1.15
+    _MIN_SCALE = 0.05
+    _MAX_SCALE = 6.0
+
+    def eventFilter(self, obj, event):
+        # Intercept wheel events on the view's viewport so we can zoom
+        # toward the cursor. Using view.scale() from the parent widget
+        # (the previous implementation) bypasses AnchorUnderMouse because
+        # the view never sees the wheel position; the fix is to do the
+        # scale-then-translate dance manually here in scene coordinates.
+        if obj is self.view.viewport() and event.type() == event.Type.Wheel:
+            self._zoom_at_cursor(event)
+            return True
+        return super().eventFilter(obj, event)
+
+    def _current_scale(self) -> float:
+        t = self.view.transform()
+        # Uniform-scale assumption (no shear/rotation in this editor).
+        return (abs(t.m11()) + abs(t.m22())) * 0.5
+
+    def _zoom_at_cursor(self, event):
+        delta = event.angleDelta().y()
+        if delta == 0:
+            return
+
+        # Step proportional to wheel delta — supports high-resolution
+        # trackpads as well as classic 120-unit notches.
+        notches = delta / 120.0
+        factor = self._ZOOM_STEP ** notches
+
+        cur = self._current_scale()
+        target = cur * factor
+        if target < self._MIN_SCALE:
+            factor = self._MIN_SCALE / cur
+        elif target > self._MAX_SCALE:
+            factor = self._MAX_SCALE / cur
+        if abs(factor - 1.0) < 1e-4:
+            return
+
+        # Position of the cursor relative to the viewport.
+        vp_pos = event.position().toPoint()
+        scene_before = self.view.mapToScene(vp_pos)
+
+        self.view.scale(factor, factor)
+
+        scene_after = self.view.mapToScene(vp_pos)
+        delta_scene = scene_after - scene_before
+        # Translate the view so the same scene point stays under the cursor.
+        self.view.translate(delta_scene.x(), delta_scene.y())
+
         event.accept()
+
+    def wheelEvent(self, event):
+        # Wheel on the panel chrome (outside the view) — ignore. The real
+        # zoom handler is the viewport event filter above.
+        event.ignore()
 
 
 # ═══════════════════════════════════════════════════════════════════════════

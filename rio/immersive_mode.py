@@ -25,6 +25,8 @@ Head pointer rationale:
 import time
 import math
 import sys
+import threading
+import queue
 
 from PySide6.QtWidgets import (
     QWidget, QGraphicsDropShadowEffect, QGraphicsProxyWidget,
@@ -33,9 +35,10 @@ from PySide6.QtWidgets import (
 from PySide6.QtCore import (
     QObject, Signal, QTimer, QPoint, QPointF, Qt,
     Property, QPropertyAnimation, QEasingCurve, QRectF,
+    QVariantAnimation, QThread,
 )
 from PySide6.QtGui import (
-    QPainter, QPen, QColor, QBrush, QTransform,
+    QPainter, QPen, QColor, QBrush, QTransform, QPolygonF,
 )
 
 try:
@@ -52,45 +55,136 @@ except ImportError:
 # Camera Manager
 # ═══════════════════════════════════════════════════════════════════════
 
-class CameraManager(QObject):
-    """Camera capture with MediaPipe Face Mesh + Hands."""
-    frame_ready = Signal(object, object, object)  # frame, face_landmarks, hands_data
+class _MediaPipeWorker(QThread):
+    """Background thread that runs MediaPipe inference.
+
+    Why a separate thread:
+      face_mesh.process() and hands.process() are CPU-bound and each
+      takes 15-40 ms per call. Running them back-to-back at 30 Hz on
+      the Qt thread blocks every animation, every paint, every input
+      event by up to 80 ms per camera tick — which is exactly when
+      the user is moving their head and expecting smooth feedback.
+
+    Design:
+      - A bounded queue (size 1) of raw frames. If inference is slow
+        we DROP frames rather than buffer them — landmark data from
+        300 ms ago is worse than no data, because the cursor would
+        lag behind reality.
+      - One thread runs both face + hands sequentially (they share
+        the same RGB conversion). MediaPipe instances are NOT
+        thread-safe so they're created on this thread.
+      - Results emitted via a signal, which Qt marshals back to the
+        main thread automatically — main thread gets clean callbacks
+        with zero locking.
+    """
+    result_ready = Signal(object, object, object)  # frame, face_landmarks, hands_data
 
     def __init__(self):
         super().__init__()
-        self.capture = None
-        self.is_running = False
-        self.timer = QTimer()
-        self.timer.timeout.connect(self._capture_frame)
+        self._frames = queue.Queue(maxsize=1)
+        self._running = False
+        self._face_model = None
+        self._hands_model = None
 
-        self.mp_face_mesh = None
-        self.face_mesh_model = None
-        self.mp_hands = None
-        self.hands_model = None
-
-    def initialize_mediapipe(self) -> bool:
-        if not _HAS_MEDIAPIPE:
-            return False
+    def submit_frame(self, frame):
+        """Called from camera thread. Drops the oldest pending frame if any."""
         try:
-            self.mp_face_mesh = mp.solutions.face_mesh
-            self.face_mesh_model = self.mp_face_mesh.FaceMesh(
+            self._frames.put_nowait(frame)
+        except queue.Full:
+            # Drop the older frame in favour of the newer one
+            try:
+                self._frames.get_nowait()
+            except queue.Empty:
+                pass
+            try:
+                self._frames.put_nowait(frame)
+            except queue.Full:
+                pass
+
+    def stop(self):
+        self._running = False
+        # Unblock the queue
+        try:
+            self._frames.put_nowait(None)
+        except queue.Full:
+            pass
+
+    def run(self):
+        if not _HAS_MEDIAPIPE:
+            return
+        try:
+            self._face_model = mp.solutions.face_mesh.FaceMesh(
                 static_image_mode=False,
                 max_num_faces=1,
                 refine_landmarks=True,
                 min_detection_confidence=0.5,
                 min_tracking_confidence=0.5,
             )
-            self.mp_hands = mp.solutions.hands
-            self.hands_model = self.mp_hands.Hands(
+            self._hands_model = mp.solutions.hands.Hands(
                 static_image_mode=False,
                 max_num_hands=2,
                 min_detection_confidence=0.7,
                 min_tracking_confidence=0.5,
             )
-            return True
         except Exception as e:
-            print(f"[ImmersiveMode] MediaPipe init error: {e}")
-            return False
+            print(f"[ImmersiveMode] MediaPipe worker init error: {e}")
+            return
+
+        self._running = True
+        while self._running:
+            try:
+                frame = self._frames.get(timeout=0.5)
+            except queue.Empty:
+                continue
+            if frame is None:
+                break
+
+            rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
+
+            face_landmarks = None
+            face_results = self._face_model.process(rgb)
+            if face_results.multi_face_landmarks:
+                face_landmarks = face_results.multi_face_landmarks[0]
+
+            hand_results = self._hands_model.process(rgb)
+            hands_data = []
+            if hand_results.multi_hand_landmarks and hand_results.multi_handedness:
+                for hl, hc in zip(hand_results.multi_hand_landmarks,
+                                  hand_results.multi_handedness):
+                    hands_data.append((hl, hc.classification[0].label))
+
+            # Emit. Qt auto-marshals to the receiver's thread.
+            self.result_ready.emit(frame, face_landmarks, hands_data)
+
+        try:
+            self._face_model.close()
+            self._hands_model.close()
+        except Exception:
+            pass
+
+
+class CameraManager(QObject):
+    """Camera capture with MediaPipe inference on a worker thread."""
+    frame_ready = Signal(object, object, object)  # frame, face_landmarks, hands_data
+
+    def __init__(self):
+        super().__init__()
+        self.capture = None
+        self.is_running = False
+        # Camera read still happens on the Qt thread via a timer —
+        # cv2.VideoCapture.read() is fast (a few ms) and keeping it on
+        # the main thread avoids cross-thread V4L2/AVFoundation issues.
+        # The expensive part (MediaPipe inference) is in _worker.
+        self.timer = QTimer()
+        self.timer.timeout.connect(self._capture_frame)
+
+        self._worker = _MediaPipeWorker()
+        self._worker.result_ready.connect(self._on_worker_result)
+
+    def initialize_mediapipe(self) -> bool:
+        # Kept for API compatibility; the worker initializes models
+        # lazily on its own thread when start() is called.
+        return _HAS_MEDIAPIPE
 
     def start(self) -> bool:
         if not _HAS_MEDIAPIPE:
@@ -98,7 +192,8 @@ class CameraManager(QObject):
         self.capture = cv2.VideoCapture(0)
         if self.capture.isOpened():
             self.is_running = True
-            self.timer.start(33)  # ~30 fps
+            self._worker.start()
+            self.timer.start(33)  # ~30 fps camera read; worker drops if behind
             return True
         return False
 
@@ -108,26 +203,22 @@ class CameraManager(QObject):
         ret, frame = self.capture.read()
         if not ret:
             return
-        rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
+        # Hand off to worker. Frame is a numpy array; OpenCV's read()
+        # returns a fresh buffer each call so the worker can hold it
+        # without race conditions.
+        self._worker.submit_frame(frame)
 
-        face_landmarks = None
-        face_results = self.face_mesh_model.process(rgb)
-        if face_results.multi_face_landmarks:
-            face_landmarks = face_results.multi_face_landmarks[0]
-
-        hand_results = self.hands_model.process(rgb)
-        hands_data = []
-        if hand_results.multi_hand_landmarks and hand_results.multi_handedness:
-            for hl, hc in zip(hand_results.multi_hand_landmarks,
-                              hand_results.multi_handedness):
-                label = hc.classification[0].label  # "Left" or "Right"
-                hands_data.append((hl, label))
-
+    def _on_worker_result(self, frame, face_landmarks, hands_data):
+        # Re-emit on the main thread (Qt has already marshalled here).
+        # Existing consumers don't need to change.
         self.frame_ready.emit(frame, face_landmarks, hands_data)
 
     def stop(self):
         self.is_running = False
         self.timer.stop()
+        self._worker.stop()
+        if self._worker.isRunning():
+            self._worker.wait(2000)
         if self.capture:
             self.capture.release()
             self.capture = None
@@ -141,7 +232,29 @@ class FaceMeshWidget(QWidget):
     """Draws the MediaPipe face mesh with isometric 3D rotation.
 
     Sized generously so the mesh never clips.
+
+    Performance:
+      - All 478 landmark projections are done in one NumPy operation
+        instead of a Python loop calling math.cos/sin 4 times each.
+        Saves ~3000 trig calls per frame.
+      - Tesselation index array is built once from MediaPipe's
+        FACEMESH_TESSELATION constant and reused.
+      - Line drawing is batched via QPainter.drawLines(QLineF[...]),
+        which is one C++ call instead of ~2700 (one per edge).
+      - Repaint is throttled: the face mesh visual doesn't need 30 Hz
+        to look smooth; 20 Hz is fine and frees 33% of the budget.
     """
+
+    # Class-level cache of (start, end) index pairs as a NumPy array.
+    # Built lazily once when mediapipe is available.
+    _conn_idx = None
+
+    @classmethod
+    def _ensure_conn_idx(cls):
+        if cls._conn_idx is not None or not _HAS_MEDIAPIPE:
+            return
+        conns = mp.solutions.face_mesh.FACEMESH_TESSELATION
+        cls._conn_idx = np.array(list(conns), dtype=np.int32)  # shape (E, 2)
 
     def __init__(self, parent=None):
         super().__init__(parent)
@@ -153,7 +266,9 @@ class FaceMeshWidget(QWidget):
 
         self.current_frame = None
         self.face_landmarks = None
-        self.smoothed_landmarks = None
+        # Smoothed landmarks stored as a NumPy array (N, 3) — much
+        # cheaper to update and reuse than a list of dicts.
+        self._smoothed_arr = None  # np.ndarray shape (N, 3) or None
 
         # Smoothing for the face mesh rendering (visual only, NOT the pointer)
         self.smoothing_factor = 0.45
@@ -167,70 +282,105 @@ class FaceMeshWidget(QWidget):
         self.scale_y = 0.8
         self.face_scale = 2.2
 
-    def _smooth(self, new_landmarks):
-        if self.smoothed_landmarks is None:
-            self.smoothed_landmarks = [
-                {"x": lm.x, "y": lm.y, "z": lm.z}
-                for lm in new_landmarks.landmark
-            ]
-            return self.smoothed_landmarks
-        alpha = 1.0 - self.smoothing_factor
+        # Repaint throttle: don't repaint more than ~20 Hz even if
+        # set_face_data is called at 30 Hz. The face mesh is decorative;
+        # smoother is not noticeably better.
+        self._last_repaint_t = 0.0
+        self._min_repaint_interval = 1.0 / 22.0  # ~22 Hz cap
+
+        self._ensure_conn_idx()
+
+    def _ingest_landmarks(self, new_landmarks):
+        """Pull landmark x/y/z into a (N, 3) array, applying EMA smoothing."""
+        n = len(new_landmarks.landmark)
+        # Build the raw frame array. One Python loop over landmarks is
+        # unavoidable since mediapipe returns a protobuf, not a buffer.
+        raw = np.empty((n, 3), dtype=np.float32)
         for i, lm in enumerate(new_landmarks.landmark):
-            if i < len(self.smoothed_landmarks):
-                s = self.smoothed_landmarks[i]
-                s["x"] = alpha * lm.x + (1 - alpha) * s["x"]
-                s["y"] = alpha * lm.y + (1 - alpha) * s["y"]
-                s["z"] = alpha * lm.z + (1 - alpha) * s["z"]
-        return self.smoothed_landmarks
+            raw[i, 0] = lm.x
+            raw[i, 1] = lm.y
+            raw[i, 2] = lm.z
+
+        if self._smoothed_arr is None or self._smoothed_arr.shape[0] != n:
+            self._smoothed_arr = raw.copy()
+        else:
+            alpha = 1.0 - self.smoothing_factor
+            # In-place vectorized EMA
+            self._smoothed_arr *= (1.0 - alpha)
+            self._smoothed_arr += alpha * raw
 
     def set_face_data(self, frame, landmarks):
         self.current_frame = frame
         self.face_landmarks = landmarks
         if landmarks:
-            self._smooth(landmarks)
-        self.update()
+            self._ingest_landmarks(landmarks)
+        now = time.monotonic()
+        if now - self._last_repaint_t >= self._min_repaint_interval:
+            self._last_repaint_t = now
+            self.update()
 
-    def _project(self, x, y, z=0):
-        cx, cy = 0.5, 0.5
-        xc, yc, zc = x - cx, y - cy, z
+    def _project_all(self):
+        """Vectorized 3D-to-2D projection of every landmark at once.
+
+        Returns an (N, 2) float32 array of pixel coordinates, already
+        scaled by widget width/height.
+        """
+        a = self._smoothed_arr
+        # Mirror X to feel natural
+        x = 1.0 - a[:, 0] - 0.5
+        y = a[:, 1] - 0.5
+        z = a[:, 2]
+
         cos_y, sin_y = math.cos(self.rotation_y), math.sin(self.rotation_y)
-        xr = xc * cos_y + zc * sin_y
-        zr = -xc * sin_y + zc * cos_y
+        xr = x * cos_y + z * sin_y
+        zr = -x * sin_y + z * cos_y
+
         cos_x, sin_x = math.cos(self.rotation_x), math.sin(self.rotation_x)
-        yr = yc * cos_x - zr * sin_x
-        ix = xr * self.scale_x * self.face_scale + cx
-        iy = yr * self.scale_y * self.face_scale + cy
-        return ix, iy
+        yr = y * cos_x - zr * sin_x
+
+        ix = (xr * self.scale_x * self.face_scale + 0.5) * self.width()
+        iy = (yr * self.scale_y * self.face_scale + 0.5) * self.height()
+
+        return np.column_stack((ix, iy)).astype(np.float32)
 
     def paintEvent(self, event):
         painter = QPainter(self)
         painter.setRenderHint(QPainter.Antialiasing)
 
-        if not self.smoothed_landmarks or self.current_frame is None:
+        if self._smoothed_arr is None or self.current_frame is None:
             painter.end()
             return
 
-        w, h = self.width(), self.height()
+        pts = self._project_all()
+        n = pts.shape[0]
 
-        if _HAS_MEDIAPIPE:
-            connections = mp.solutions.face_mesh.FACEMESH_TESSELATION
-        else:
-            connections = []
+        if _HAS_MEDIAPIPE and self._conn_idx is not None:
+            # Filter out-of-range edges (defensive — refined mesh has 478)
+            cm = self._conn_idx
+            valid = (cm[:, 0] < n) & (cm[:, 1] < n)
+            edges = cm[valid]
 
-        painter.setPen(QPen(QColor(200, 210, 230, 100), 1))
-        for c in connections:
-            s, e = c
-            if s >= len(self.smoothed_landmarks) or e >= len(self.smoothed_landmarks):
-                continue
-            sl, el = self.smoothed_landmarks[s], self.smoothed_landmarks[e]
-            sx, sy = self._project(1 - sl["x"], sl["y"], sl["z"])
-            ex, ey = self._project(1 - el["x"], el["y"], el["z"])
-            painter.drawLine(int(sx * w), int(sy * h), int(ex * w), int(ey * h))
+            # Build flat float array of x1,y1,x2,y2,x1,y1,... for drawLines
+            starts = pts[edges[:, 0]]
+            ends = pts[edges[:, 1]]
+            # Interleave into one big array
+            lines = np.empty((edges.shape[0], 4), dtype=np.float32)
+            lines[:, 0:2] = starts
+            lines[:, 2:4] = ends
 
+            from PySide6.QtCore import QLineF
+            qlines = [
+                QLineF(float(l[0]), float(l[1]), float(l[2]), float(l[3]))
+                for l in lines
+            ]
+            painter.setPen(QPen(QColor(200, 210, 230, 100), 1))
+            painter.drawLines(qlines)
+
+        # Draw landmark points as one batched call
         painter.setPen(QPen(QColor(240, 245, 255), 2))
-        for lm in self.smoothed_landmarks:
-            px, py = self._project(1 - lm["x"], lm["y"], lm["z"])
-            painter.drawPoint(int(px * w), int(py * h))
+        from PySide6.QtCore import QPointF as _QPF
+        qpoints = [_QPF(float(p[0]), float(p[1])) for p in pts]
+        painter.drawPoints(qpoints)
 
         painter.end()
 
@@ -515,6 +665,16 @@ class ImmersiveMode(QObject):
         # Shadow bookkeeping
         self._shadow_timers = []
         self._added_shadows = {}  # id(item) → shadow
+        # Coalesced QVariantAnimation that drives ALL shadow offsets at
+        # once. One timer instead of N — replaces the old per-shadow
+        # QTimer pattern that ticked 60×/s × N proxies.
+        self._batch_shadow_anim = None
+
+        # Proxy cache for gravity calculation. Invalidated by the
+        # explicit method on scene changes; otherwise re-collected
+        # every 0.25 s. See _get_visible_proxies for rationale.
+        self._proxy_cache = None
+        self._proxy_cache_t = 0.0
 
         # Selection
         self._selected_proxy = None
@@ -567,6 +727,22 @@ class ImmersiveMode(QObject):
     # ── Step helpers ──
 
     def _add_and_animate_shadows(self, target_offset, duration_ms):
+        """Install shadows on all proxies and animate offsets in one batch.
+
+        The earlier implementation created one QTimer per shadow at 16 ms
+        cadence. With 20 proxies that's 20 timers firing 60 times/sec,
+        each waking Python and invalidating its shadow's offscreen
+        buffer separately. The replacement uses one QVariantAnimation
+        whose tick callback updates every shadow in a single sweep —
+        Qt batches the resulting dirty regions far better.
+        """
+        # Register shadows with the main window's tracking set so the
+        # patched theme/dark animations can manage them too. The window
+        # provides _shadowed_items / register_shadowed (see main.py
+        # performance patches). Falls back gracefully if absent.
+        register = getattr(self.main_window, 'register_shadowed', None)
+
+        records = []
         for item in list(self.graphics_scene.items()):
             if not isinstance(item, QGraphicsProxyWidget):
                 continue
@@ -581,57 +757,111 @@ class ImmersiveMode(QObject):
                 effect = shadow
 
             if isinstance(effect, QGraphicsDropShadowEffect) and _shadow_alive(effect):
-                self._animate_shadow_offset(
-                    effect,
-                    start_x=effect.xOffset(), start_y=effect.yOffset(),
-                    end_x=target_offset, end_y=target_offset,
-                    duration_ms=duration_ms,
-                    easing=QEasingCurve.OutInCirc,
-                )
+                records.append({
+                    'effect': effect,
+                    'sx': float(effect.xOffset()),
+                    'sy': float(effect.yOffset()),
+                })
+                if register:
+                    register(item)
+
+        if not records:
+            return
+
+        self._run_batch_shadow_animation(
+            records, target_offset, target_offset,
+            duration_ms, QEasingCurve.OutInCirc,
+        )
+
+    def _run_batch_shadow_animation(self, records, end_x, end_y,
+                                     duration_ms, easing):
+        """Drive N shadow offsets to the same (end_x, end_y) in one anim."""
+        # Stop any in-flight batch first
+        if self._batch_shadow_anim is not None:
+            try:
+                self._batch_shadow_anim.stop()
+                self._batch_shadow_anim.deleteLater()
+            except RuntimeError:
+                pass
+            self._batch_shadow_anim = None
+
+        anim = QVariantAnimation(self)
+        anim.setDuration(duration_ms)
+        anim.setStartValue(0.0)
+        anim.setEndValue(1.0)
+        anim.setEasingCurve(easing)
+
+        def tick(t):
+            for rec in records:
+                effect = rec['effect']
+                if not _shadow_alive(effect):
+                    continue
+                ox = rec['sx'] + (end_x - rec['sx']) * t
+                oy = rec['sy'] + (end_y - rec['sy']) * t
+                try:
+                    effect.setOffset(ox, oy)
+                except RuntimeError:
+                    pass
+
+        def on_finished():
+            # Snap to exact final values to eliminate any rounding drift
+            for rec in records:
+                effect = rec['effect']
+                if _shadow_alive(effect):
+                    try:
+                        effect.setOffset(end_x, end_y)
+                    except RuntimeError:
+                        pass
+            self._batch_shadow_anim = None
+
+        anim.valueChanged.connect(tick)
+        anim.finished.connect(on_finished)
+        self._batch_shadow_anim = anim
+        anim.start()
 
     def _animate_shadow_offset(self, shadow, start_x, start_y,
                                 end_x, end_y, duration_ms, easing):
-        """Timer-driven shadow offset animation. Guarded against C++ deletion."""
-        steps = max(1, duration_ms // 16)
-        step = [0]
-        curve = QEasingCurve(easing)
+        """Single-shadow animation, used by selection/release.
 
-        def tick():
+        Kept as its own method (rather than routed through the batched
+        path) because pinch select/release operates on exactly one
+        shadow at a time, and the batched path's bookkeeping would be
+        wasted overhead. Still uses QVariantAnimation rather than a
+        raw QTimer so Qt can manage the lifecycle.
+        """
+        anim = QVariantAnimation(self)
+        anim.setDuration(duration_ms)
+        anim.setStartValue(0.0)
+        anim.setEndValue(1.0)
+        anim.setEasingCurve(easing)
+
+        def tick(t):
             if not _shadow_alive(shadow):
-                timer.stop()
-                if timer in self._shadow_timers:
-                    self._shadow_timers.remove(timer)
-                timer.deleteLater()
+                anim.stop()
                 return
+            try:
+                shadow.setOffset(
+                    start_x + (end_x - start_x) * t,
+                    start_y + (end_y - start_y) * t,
+                )
+            except RuntimeError:
+                anim.stop()
 
-            if step[0] > steps:
+        def on_finished():
+            if _shadow_alive(shadow):
                 try:
                     shadow.setOffset(end_x, end_y)
                 except RuntimeError:
                     pass
-                timer.stop()
-                if timer in self._shadow_timers:
-                    self._shadow_timers.remove(timer)
-                timer.deleteLater()
-                return
 
-            t = curve.valueForProgress(step[0] / steps)
-            ox = start_x + (end_x - start_x) * t
-            oy = start_y + (end_y - start_y) * t
-            try:
-                shadow.setOffset(ox, oy)
-            except RuntimeError:
-                timer.stop()
-                if timer in self._shadow_timers:
-                    self._shadow_timers.remove(timer)
-                timer.deleteLater()
-                return
-            step[0] += 1
-
-        timer = QTimer(self)
-        self._shadow_timers.append(timer)
-        timer.timeout.connect(tick)
-        timer.start(16)
+        anim.valueChanged.connect(tick)
+        anim.finished.connect(on_finished)
+        # Track on self so it isn't GC'd mid-flight. Old timers list
+        # is reused for this purpose; entries are pruned on finish.
+        self._shadow_timers.append(anim)
+        anim.finished.connect(lambda: self._shadow_timers.remove(anim)
+                              if anim in self._shadow_timers else None)
+        anim.start()
 
     def _animate_view_tilt(self):
         vp = self.graphics_view.viewport()
@@ -750,24 +980,33 @@ class ImmersiveMode(QObject):
         QTimer.singleShot(2200, self._deactivation_done)
 
     def _retract_shadows(self, duration_ms):
+        """Animate all immersive shadows back to (0, 0) in one batch."""
+        unregister = getattr(self.main_window, 'unregister_shadowed', None)
+
+        records = []
         for item in list(self.graphics_scene.items()):
             if not isinstance(item, QGraphicsProxyWidget):
                 continue
             effect = item.graphicsEffect()
             if isinstance(effect, QGraphicsDropShadowEffect) and _shadow_alive(effect):
-                self._animate_shadow_offset(
-                    effect,
-                    start_x=effect.xOffset(), start_y=effect.yOffset(),
-                    end_x=0, end_y=0,
-                    duration_ms=duration_ms,
-                    easing=QEasingCurve.InOutCubic,
-                )
+                records.append({
+                    'effect': effect,
+                    'sx': float(effect.xOffset()),
+                    'sy': float(effect.yOffset()),
+                })
+
+        if records:
+            self._run_batch_shadow_animation(
+                records, 0, 0, duration_ms, QEasingCurve.InOutCubic,
+            )
 
         def _cleanup():
             for item in list(self.graphics_scene.items()):
                 if id(item) in self._added_shadows:
                     try:
                         item.setGraphicsEffect(None)
+                        if unregister:
+                            unregister(item)
                     except RuntimeError:
                         pass
             self._added_shadows.clear()
@@ -797,6 +1036,41 @@ class ImmersiveMode(QObject):
     _GRAVITY_STRENGTH = 1.0  # full pull
     _SNAP_RADIUS = 200       # px — lock on early
 
+    def _invalidate_proxy_cache(self):
+        """Force the next gravity call to re-scan the scene."""
+        self._proxy_cache_t = 0.0
+        self._proxy_cache = None
+
+    def _get_visible_proxies(self):
+        """Return (proxy, scene_centre_QPointF) pairs, cached.
+
+        The scene scan is the hot path here — it happens at the
+        MediaPipe frame rate (30 Hz) and walks every item in the
+        scene. Caching for 250 ms removes that scan from 24 of every
+        30 frames while still picking up newly-added widgets within
+        a noticeable but acceptable delay.
+
+        Cache is invalidated explicitly when we know the scene
+        changed (e.g. on pinch release of a moved item).
+        """
+        now = time.monotonic()
+        if (self._proxy_cache is not None and
+                now - self._proxy_cache_t < 0.25):
+            return self._proxy_cache
+
+        result = []
+        for item in self.graphics_scene.items():
+            if not isinstance(item, QGraphicsProxyWidget):
+                continue
+            if not item.isVisible():
+                continue
+            scene_centre = item.mapToScene(item.boundingRect().center())
+            result.append((item, scene_centre))
+
+        self._proxy_cache = result
+        self._proxy_cache_t = now
+        return result
+
     def _apply_widget_gravity(self, gaze_pos: QPointF) -> QPointF:
         """Bend gaze_pos toward the nearest visible proxy widget centre.
 
@@ -808,32 +1082,33 @@ class ImmersiveMode(QObject):
           4. If within _SNAP_RADIUS, snap fully to the widget centre.
 
         Only the single nearest widget attracts — no tug-of-war.
+
+        The scene→window mapping IS done per-frame even with caching,
+        because the view transform can change continuously (orbit, pan,
+        zoom). Only the proxy list itself is cached.
         """
         best_centre = None
-        best_dist = float("inf")
+        best_dist_sq = float("inf")
+        gx, gy = gaze_pos.x(), gaze_pos.y()
 
-        for item in self.graphics_scene.items():
-            if not isinstance(item, QGraphicsProxyWidget):
-                continue
-            if not item.isVisible():
-                continue
-
-            # Scene-space centre of the proxy's bounding rect
-            scene_centre = item.mapToScene(item.boundingRect().center())
-
-            # → viewport local → window coords
+        for item, scene_centre in self._get_visible_proxies():
+            # Map scene→viewport→window. We do this in two C++ calls
+            # rather than the previous three-step chain.
             view_local = self.graphics_view.mapFromScene(scene_centre)
             win_pt = self.graphics_view.mapToParent(view_local)
+            dx = gx - win_pt.x()
+            dy = gy - win_pt.y()
+            dist_sq = dx * dx + dy * dy  # skip sqrt until we need it
 
-            dx = gaze_pos.x() - win_pt.x()
-            dy = gaze_pos.y() - win_pt.y()
-            dist = math.sqrt(dx * dx + dy * dy)
-
-            if dist < best_dist:
-                best_dist = dist
+            if dist_sq < best_dist_sq:
+                best_dist_sq = dist_sq
                 best_centre = QPointF(win_pt.x(), win_pt.y())
 
-        if best_centre is None or best_dist > self._GRAVITY_RADIUS:
+        if best_centre is None:
+            return gaze_pos
+
+        best_dist = math.sqrt(best_dist_sq)
+        if best_dist > self._GRAVITY_RADIUS:
             return gaze_pos  # nothing nearby — no attraction
 
         if best_dist < self._SNAP_RADIUS:
@@ -846,8 +1121,8 @@ class ImmersiveMode(QObject):
         t = t * t  # quadratic ease — gentle at the edge, firm close up
         pull = t * self._GRAVITY_STRENGTH
 
-        attracted_x = gaze_pos.x() + (best_centre.x() - gaze_pos.x()) * pull
-        attracted_y = gaze_pos.y() + (best_centre.y() - gaze_pos.y()) * pull
+        attracted_x = gx + (best_centre.x() - gx) * pull
+        attracted_y = gy + (best_centre.y() - gy) * pull
 
         return QPointF(attracted_x, attracted_y)
 
@@ -990,8 +1265,16 @@ class ImmersiveMode(QObject):
             shadow.setColor(QColor(255, 255, 255, 160) if dark else QColor(0, 0, 0, 120))
             shadow.setOffset(45, 45)
             proxy.setGraphicsEffect(shadow)
+            # Re-register so it tracks with main window's shadow set
+            register = getattr(self.main_window, 'register_shadowed', None)
+            if register:
+                register(proxy)
         except RuntimeError:
             pass
+
+        # The item likely moved during drag — invalidate gravity cache
+        # so the next frame re-collects fresh scene-space centres.
+        self._invalidate_proxy_cache()
 
         self._selected_proxy = None
         self._pinch_item = None

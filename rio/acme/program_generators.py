@@ -680,6 +680,66 @@ container.resizeEvent = _resize
 '''
 
 
+def generate_url_viewer(url):
+    """Generate a program that displays a URL in an embedded QWebEngineView."""
+    # Normalize: add scheme if missing
+    if not url:
+        return generate_message_display("(empty url)", "URL")
+    u = url.strip()
+    low = u.lower()
+    if not (low.startswith('http://') or low.startswith('https://')
+            or low.startswith('file://') or low.startswith('ftp://')):
+        u = 'https://' + u
+    # Escape for embedding in a Python string literal
+    url_escaped = u.replace('\\', '\\\\').replace('"', '\\"')
+
+    return f'''# URL Viewer
+# URL: {u}
+from PySide6.QtCore import QUrl
+from PySide6.QtWidgets import QVBoxLayout, QLabel, QWidget
+
+try:
+    from PySide6.QtWebEngineWidgets import QWebEngineView
+    _have_web = True
+except ImportError:
+    _have_web = False
+
+if _have_web:
+    view = QWebEngineView()
+    view.setUrl(QUrl("{url_escaped}"))
+    view.setParent(container)
+    view.setGeometry(0, 0, container.width() or 800, container.height() or 600)
+
+    def _resize(ev, w=view, c=container):
+        w.setGeometry(0, 0, c.width(), c.height())
+        type(c).resizeEvent(c, ev)
+    container.resizeEvent = _resize
+    container.web_view = view
+    view.show()
+else:
+    label = QLabel("PySide6.QtWebEngineWidgets not installed.\\n"
+                   "Install with: pip install PySide6-Addons\\n\\n"
+                   "URL: {url_escaped}")
+    label.setStyleSheet("""
+        QLabel {{
+            background-color: rgba(255, 255, 255, 80);
+            font-family: 'Consolas', 'Monaco', monospace;
+            font-size: 13px;
+            color: black;
+            padding: 12px;
+        }}
+    """)
+    label.setWordWrap(True)
+    label.setParent(container)
+    label.setGeometry(0, 0, container.width() or 600, container.height() or 400)
+
+    def _resize(ev, w=label, c=container):
+        w.setGeometry(0, 0, c.width(), c.height())
+        type(c).resizeEvent(c, ev)
+    container.resizeEvent = _resize
+'''
+
+
 def generate_terminal(working_dir=None):
     """Generate a Plan9 Acme-style terminal program"""
     if working_dir is None:

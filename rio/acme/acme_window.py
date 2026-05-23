@@ -119,7 +119,15 @@ class AcmeWindow(QFrame):
                  rio_mount="/n/mux/default",
                  p9_host="localhost", p9_port=5640):
         super().__init__(parent)
-        self.path = os.path.abspath(path) if (path and not os.path.isabs(path)) else (path or "")
+        # URLs and absolute paths are kept as-is; only relative FS paths
+        # get abspath()'d.
+        from .content_detector import is_url
+        if not path:
+            self.path = ""
+        elif is_url(path) or os.path.isabs(path):
+            self.path = path
+        else:
+            self.path = os.path.abspath(path)
 
         from .acme_clean import get_next_window_id
         self.window_id = get_next_window_id()
@@ -521,6 +529,10 @@ class AcmeWindow(QFrame):
         """
         if not text:
             return None
+        # URLs are always plumbable — no FS probe, no path resolution
+        from .content_detector import is_url
+        if is_url(text):
+            return text
         # Already absolute
         if os.path.isabs(text):
             # For /n/ paths, assume they exist — load_content will handle
@@ -681,11 +693,16 @@ class AcmeWindow(QFrame):
         words = self.tag_line.toPlainText().strip().split()
         if words:
             p = words[0]
-            if not os.path.isabs(p):
-                if self.path and os.path.dirname(self.path):
-                    p = os.path.join(os.path.dirname(self.path), p)
-                else: p = os.path.abspath(p)
-            self.path = p
+            # URLs: keep as-is, don't try to resolve as filesystem path
+            from .content_detector import is_url
+            if is_url(p):
+                self.path = p
+            else:
+                if not os.path.isabs(p):
+                    if self.path and os.path.dirname(self.path):
+                        p = os.path.join(os.path.dirname(self.path), p)
+                    else: p = os.path.abspath(p)
+                self.path = p
             self._dirty = False
             self._update_tag_line()
             self.load_content()
@@ -902,6 +919,21 @@ class AcmeWindow(QFrame):
         blocking I/O on the main thread would deadlock.
         """
         if not self.path:
+            return
+
+        # URLs: never touch the FS — go straight to the web view.
+        # Route through execute_code_from_fs so the URL ends up in
+        # accumulated_code (and thus in the agent's history), giving the
+        # LLM context about what URL is currently open — same pattern as
+        # gif/image/pdf viewers.
+        from .content_detector import is_url
+        if is_url(self.path):
+            try:
+                code = generate_url_viewer(self.path)
+                self.execute_code_from_fs(code)
+            except Exception as e:
+                self.text_pane.setPlainText(f"Error loading URL {self.path}: {e}")
+                self.pane_stack.setCurrentIndex(0)
             return
 
         if _is_9p_path(self.path):
@@ -1142,7 +1174,8 @@ container.file_path = '{path_escaped}'
             elif self._path_isfile(path):
                 ct = 'text'
         code = None
-        if ct == 'directory': code = generate_directory_listing(path)
+        if ct == 'url': code = generate_url_viewer(path)
+        elif ct == 'directory': code = generate_directory_listing(path)
         elif ct == 'image': code = generate_image_viewer(path)
         elif ct == 'video': code = generate_video_player(path)
         elif ct == 'audio': code = generate_audio_player(path)
@@ -1468,6 +1501,18 @@ container.text_edit = text_edit
     # ------------------------------------------------------------------
 
     def plumb(self, text):
+        # URLs: open directly in a new window — no FS resolution
+        from .content_detector import is_url
+        if is_url(text):
+            col = self.get_parent_column()
+            if col:
+                acme = self.get_acme_parent()
+                tc = acme.preferred_column if acme and acme.preferred_column else col
+                nw = tc.add_window(text)
+                if nw and nw.text_pane:
+                    QTimer.singleShot(50, lambda w=nw: self._warp_to_start(w))
+            return
+
         full = text.rstrip('/')  # normalize trailing slash but keep path
         if not os.path.isabs(full):
             if self.path:
@@ -1526,14 +1571,21 @@ container.text_edit = text_edit
         cur = tw.cursorForPosition(cpos)
         text = tw.toPlainText(); pos = cur.position()
         if pos < 0 or pos >= len(text): return None
+        # Char class includes URL-friendly chars (?, =, &, #, %, @)
+        # so URLs like https://example.com/p?q=1#frag stay in one token.
+        path_chars = '/-_.~:+?=&#%@'
         s = pos
-        while s > 0 and (text[s-1].isalnum() or text[s-1] in '/-_.~:+'): s -= 1
+        while s > 0 and (text[s-1].isalnum() or text[s-1] in path_chars): s -= 1
         e = pos
-        while e < len(text) and (text[e].isalnum() or text[e] in '/-_.~:+'): e += 1
+        while e < len(text) and (text[e].isalnum() or text[e] in path_chars): e += 1
         if s >= e: return None
         pt = text[s:e]
         while pt and pt[-1] in ',:;!?)': pt = pt[:-1]; e -= 1
         if not pt: return None
+        # URLs are always plumbable (no FS check)
+        from .content_detector import is_url
+        if is_url(pt):
+            return (pt, s, e)
         if '/' in pt or pt.startswith('./') or pt.startswith('../'):
             return (pt, s, e)
         # For /n/ paths, skip _path_isdir/_path_exists probes (deadlock risk)

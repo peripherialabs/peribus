@@ -85,7 +85,8 @@ AGENT_PROFILES = {
         "agent_name": "av",                              # shared dirname under llmfs root
         "init_cmd": "grok av",                            # written to /n/llm/ctl
         "default_voice": "Ara",
-        "config_extra": {"tool_choice": "required", "temperature": 0.8},
+        #"config_extra": {"tool_choice": "required", "temperature": 0.8},
+        "config_extra": {"tool_choice": "auto", "temperature": 0.8},
         "iris_color": QColor(160, 115, 55),
         "iris_rim_color": QColor(100, 65, 25),
         "eye_width_scale": 1.06,
@@ -327,8 +328,8 @@ class AIVoiceControlWidget(QWidget):
         self._gaze_target_x = 0.0       # where gaze is drifting toward
         self._gaze_target_y = 0.0
         self._gaze_speed = 0.04          # interpolation speed per tick
-        self._gaze_timer = QTimer(self)
-        self._gaze_timer.timeout.connect(self._update_gaze)
+        # Saccade scheduling still uses its own single-shot timer since
+        # it fires at randomised intervals unrelated to the tick rate.
         self._gaze_saccade_timer = QTimer(self)
         self._gaze_saccade_timer.setSingleShot(True)
         self._gaze_saccade_timer.timeout.connect(self._new_gaze_target)
@@ -338,8 +339,6 @@ class AIVoiceControlWidget(QWidget):
         self._auto_blink_timer = QTimer(self)
         self._auto_blink_timer.setSingleShot(True)
         self._auto_blink_timer.timeout.connect(self._trigger_auto_blink)
-        self._auto_blink_anim_timer = QTimer(self)
-        self._auto_blink_anim_timer.timeout.connect(self._update_auto_blink)
         self._auto_blink_progress = 0.0
         self._auto_blink_phase = 0  # 0=idle, 1=closing, 2=opening
         self._auto_blink_speed = 0.18
@@ -350,14 +349,20 @@ class AIVoiceControlWidget(QWidget):
         self._tilt_offset_x = 0.0        # current translation offset
         self._tilt_offset_y = 0.0
         self._tilt_phase = 0.0           # circular motion phase (radians)
-        self._tilt_phase_speed = 0.008   # phase advance per tick
+        # Per-tick rates. Tuned for the 30 Hz timer; if you ever revert
+        # to a 60 Hz timer, halve both _tilt_phase_speed and
+        # _tilt_radius_speed to keep the visible rate identical.
+        self._tilt_phase_speed = 0.016   # phase advance per tick (~30 Hz)
         self._tilt_radius = 0.0          # current orbit distance (0-45 px)
         self._tilt_target_radius = 12.0  # target orbit distance
         self._tilt_radius_phase = 0.0    # secondary phase for varying radius
-        self._tilt_radius_speed = 0.003  # how fast radius varies
+        self._tilt_radius_speed = 0.006  # how fast radius varies (~30 Hz)
         self._tilt_max_angle = 3.5       # max rotation degrees
-        self._tilt_timer = QTimer(self)
-        self._tilt_timer.timeout.connect(self._update_tilt)
+        # ── Consolidated tick timer ───────────────────────────────────
+        # One 33 ms timer drives gaze, tilt, auto-blink animation, and
+        # mouse polling, issuing exactly one self.update() per tick.
+        self._tick_timer = QTimer(self)
+        self._tick_timer.timeout.connect(self._tick)
         self._tilt_elapsed = QElapsedTimer()
 
         # ── Drastic perspective tilt (QTransform on proxy) ────────────
@@ -389,6 +394,24 @@ class AIVoiceControlWidget(QWidget):
         self._drastic_trigger_timer.timeout.connect(self._drastic_trigger)
 
         # ── Pre-generated data ───────────────────────────────────────────
+        # Iris pixmap cache fields must exist before _gen_iris_data
+        # (which clears them) runs.
+        self._left_iris_pixmap = None
+        self._right_iris_pixmap = None
+
+        # ── Lid/brow path cache ──────────────────────────────────────
+        # The QPainterPaths for eyebrows, upper lids, lower lids, clip
+        # regions, and tear ducts only change when blink_progress,
+        # eye_open_level, auto_blink_progress, wink state, or the
+        # eyebrow_offset changes. We cache them and rebuild only on
+        # change, avoiding ~12 QPainterPath constructions per frame.
+        self._cached_eye_bp = -1.0
+        self._cached_eye_open_level = -1.0
+        self._cached_eyebrow_offset = -999.0
+        self._cached_auto_blink_progress = -1.0
+        self._cached_wink_progress = -1.0
+        self._cached_paths = {}  # keyed by (mirror, path_name)
+
         self._gen_eyelash_data()
         self._gen_iris_data()
 
@@ -407,7 +430,6 @@ class AIVoiceControlWidget(QWidget):
         if was_active:
             self._send_ctl("stop")
             self._teardown_code_route()
-            self._mouse_poll_timer.stop()
             self._stop_autonomous_animations()
             self.eyes_are_closed = True
             self.is_recording = False
@@ -428,6 +450,14 @@ class AIVoiceControlWidget(QWidget):
             self._destroy_agent()
 
         self._gen_eyelash_data()
+        # Invalidate iris pixmap caches: iris colors come from
+        # self._profile (which just changed), so the cached pixmaps for
+        # the previous agent's colors must be discarded. The pixmaps
+        # rebuild lazily on next paint.
+        self._left_iris_pixmap = None
+        self._right_iris_pixmap = None
+        # Invalidate lid/brow path cache (profile shape params changed)
+        self._cached_paths = {}
 
         self._label_opacity = 0.0
         self._label_target_opacity = 1.0
@@ -993,7 +1023,6 @@ class AIVoiceControlWidget(QWidget):
         if self.is_recording:
             self._send_ctl("stop")
             self._teardown_code_route()
-            self._mouse_poll_timer.stop()
             self._stop_autonomous_animations()
             self.eyes_are_closed = True
             self.is_recording = False
@@ -1050,14 +1079,12 @@ class AIVoiceControlWidget(QWidget):
             self.is_recording = True
             self._ensure_code_route()
             self._send_ctl("start")
-            self._mouse_poll_timer.start(33)
             self._start_autonomous_animations()
         else:
             self.eyes_are_closed = True
             self.is_recording = False
             self._send_ctl("stop")
             self._teardown_code_route()
-            self._mouse_poll_timer.stop()
             self._stop_autonomous_animations()
 
         self._eye_toggle_anim = anim
@@ -1177,11 +1204,16 @@ class AIVoiceControlWidget(QWidget):
 
     # ── Mouse tracking ───────────────────────────────────────────────────
     def _poll_mouse(self):
-        """
-        Poll QCursor.pos() at ~30fps and update iris position.
+        """Standalone mouse poll — used only when the tick timer isn't running."""
+        self._poll_mouse_internal()
+        self.update()
 
-        Only runs while eyes are open. Skips repaint if the iris
-        hasn't moved enough to be visually noticeable (dead-zone).
+    def _poll_mouse_internal(self):
+        """
+        Poll QCursor.pos() and update iris position.
+
+        Called by the consolidated _tick — does NOT call self.update().
+        Skips work if the iris hasn't moved enough to be visible (dead-zone).
         """
         if not self.mouse_tracking_enabled or self.isHidden():
             return
@@ -1212,6 +1244,10 @@ class AIVoiceControlWidget(QWidget):
 
         self._last_iris_x = ix
         self._last_iris_y = iy
+        # Cache the mouse-derived iris offset so _iris_pos can skip
+        # recomputing it (same distance/direction calculation).
+        self._mouse_iris_x = ix
+        self._mouse_iris_y = iy
         self.mouse_pos = QPointF(lx, ly)
 
         # Detect if mouse is actively near the widget (suppress auto-gaze)
@@ -1238,12 +1274,12 @@ class AIVoiceControlWidget(QWidget):
             if abs(self.eyebrow_offset) < 0.1:
                 self.eyebrow_offset = 0.0
 
-        self.update()
-
     def closeEvent(self, event):
+        # Stop all timers cleanly so they don't tick after the C++ side
+        # is gone.
+        self._tick_timer.stop()
         self._mouse_poll_timer.stop()
         self._stop_autonomous_animations()
-        self._kill_bridge()
         super().closeEvent(event)
 
     # ── Intro draw-on animation ─────────────────────────────────────────
@@ -1300,29 +1336,36 @@ class AIVoiceControlWidget(QWidget):
     # ── Random eye motion (saccades + micro-drift) ─────────────────
 
     def _start_autonomous_animations(self):
-        """Start all autonomous animations (called when eyes open)."""
+        """Start all autonomous animations (called when eyes open).
+
+        All autonomous animation subsystems (gaze, tilt, auto-blink,
+        drastic perspective) are driven by a single 33 ms (~30 fps)
+        tick timer.  This replaces the old design where 4+ independent
+        QTimers each called self.update(), scattering repaints across
+        different event-loop iterations and inflating the actual
+        repaint rate to 60-90+ fps despite no single animation needing
+        more than 30.  Now there is exactly ONE self.update() per tick.
+        """
         # Gaze
         self._gaze_offset_x = 0.0
         self._gaze_offset_y = 0.0
-        self._gaze_timer.start(33)   # ~30 fps
         self._schedule_next_saccade()
         # Auto-blink
         self._schedule_next_blink()
         # Tilt/rotate
         self._tilt_elapsed.start()
-        self._tilt_timer.start(16)   # ~60 fps
         # Drastic perspective tilt
         self._drastic_schedule()
+        # Single consolidated tick drives everything
+        self._tick_timer.start(33)
 
     def _stop_autonomous_animations(self):
         """Stop all autonomous animations (called when eyes close)."""
-        self._gaze_timer.stop()
+        self._tick_timer.stop()
         self._gaze_saccade_timer.stop()
         self._auto_blink_timer.stop()
-        self._auto_blink_anim_timer.stop()
         self._auto_blink_progress = 0.0
         self._auto_blink_phase = 0
-        self._tilt_timer.stop()
         # Drastic tilt — stop and reset proxy to identity
         self._drastic_trigger_timer.stop()
         self._drastic_hold_timer.stop()
@@ -1332,6 +1375,36 @@ class AIVoiceControlWidget(QWidget):
         self._drastic_shx = self._drastic_shy = 0.0
         if self._proxy is not None:
             self._proxy.setTransform(QTransform())
+
+    def _tick(self):
+        """Consolidated 30 fps tick — drives all autonomous animations.
+
+        Subsystems are updated in order, then a single self.update()
+        repaints the widget.  This replaces 4+ independent QTimers that
+        each triggered their own repaint.
+        """
+        if self.eyes_are_closed:
+            return
+
+        visible = self.isVisible()
+
+        # 1. Mouse poll (was its own 33 ms timer)
+        self._poll_mouse_internal()
+
+        # 2. Gaze drift
+        self._update_gaze()
+
+        # 3. Auto-blink animation step (only when active)
+        if self._auto_blink_phase > 0:
+            self._update_auto_blink()
+
+        # 4. Tilt + drastic (skip math when not visible)
+        if visible:
+            self._update_tilt()
+
+        # ONE repaint for the whole tick
+        if visible:
+            self.update()
 
     def _schedule_next_saccade(self):
         """Schedule the next random gaze shift after a random interval."""
@@ -1384,17 +1457,24 @@ class AIVoiceControlWidget(QWidget):
         self._auto_blink_timer.start(delay)
 
     def _trigger_auto_blink(self):
-        """Initiate an auto-blink (quick close-open cycle)."""
+        """Initiate an auto-blink (quick close-open cycle).
+
+        Sets up the blink phase/speed; the consolidated _tick timer
+        drives the actual animation via _update_auto_blink().
+        """
         if self.eyes_are_closed or self.is_animating or self.is_flickering:
             self._schedule_next_blink()
             return
         self._auto_blink_phase = 1  # closing
         self._auto_blink_progress = 0.0
         self._auto_blink_speed = random.uniform(0.14, 0.22)
-        self._auto_blink_anim_timer.start(16)
 
     def _update_auto_blink(self):
-        """Animate the auto-blink (fast close, slightly slower open)."""
+        """Animate the auto-blink (fast close, slightly slower open).
+
+        Called by the consolidated _tick — does NOT call self.update()
+        or manage its own animation timer.
+        """
         if self._auto_blink_phase == 1:  # closing
             self._auto_blink_progress += self._auto_blink_speed
             if self._auto_blink_progress >= 1.0:
@@ -1405,9 +1485,7 @@ class AIVoiceControlWidget(QWidget):
             if self._auto_blink_progress <= 0.0:
                 self._auto_blink_progress = 0.0
                 self._auto_blink_phase = 0
-                self._auto_blink_anim_timer.stop()
                 self._schedule_next_blink()
-        self.update()
 
     # ── Tilt / rotate / shadow (circular proxy motion) ───────────────
 
@@ -1425,7 +1503,11 @@ class AIVoiceControlWidget(QWidget):
         """
         Animate tilt: circular orbit motion with varying radius (0-18px),
         gentle rotation, and drop shadow that responds to offset.
+
+        Called by the consolidated _tick — does NOT call self.update().
+        The visibility check is done by the caller.
         """
+
         dt = 1.0  # normalized per tick
         # Advance circular orbit phase
         self._tilt_phase += self._tilt_phase_speed * dt
@@ -1453,8 +1535,6 @@ class AIVoiceControlWidget(QWidget):
         # Advance drastic perspective tilt
         self._advance_drastic()
         self._apply_proxy_transform()
-
-        self.update()
 
     # ── Drastic perspective tilt (QTransform on proxy) ───────────────
     #
@@ -1512,7 +1592,9 @@ class AIVoiceControlWidget(QWidget):
             return
 
         if self._drastic_phase == 1:          # ── attack: smooth ease-out
-            self._drastic_progress = min(1.0, self._drastic_progress + 0.025)
+            # Per-tick progress tuned for the 30 Hz tilt timer (was
+            # 0.025 at 60 Hz → 0.050 at 30 Hz to keep wall-clock duration).
+            self._drastic_progress = min(1.0, self._drastic_progress + 0.050)
             t = 1.0 - (1.0 - self._drastic_progress) ** 3
             self._drastic_sx  = self._drastic_start_sx  + (self._drastic_target_sx  - self._drastic_start_sx)  * t
             self._drastic_sy  = self._drastic_start_sy  + (self._drastic_target_sy  - self._drastic_start_sy)  * t
@@ -1523,7 +1605,8 @@ class AIVoiceControlWidget(QWidget):
                 self._drastic_hold_timer.start(random.randint(300, 650))
 
         elif self._drastic_phase == 3:        # ── release: slow ease-in-out
-            self._drastic_progress = min(1.0, self._drastic_progress + 0.010)
+            # Was 0.010 at 60 Hz → 0.020 at 30 Hz.
+            self._drastic_progress = min(1.0, self._drastic_progress + 0.020)
             # smooth ease-in-out
             if self._drastic_progress < 0.5:
                 t = 2 * self._drastic_progress ** 2
@@ -1552,9 +1635,15 @@ class AIVoiceControlWidget(QWidget):
     def _apply_proxy_transform(self):
         """Build and apply a QTransform from the current drastic parameters.
         transformOriginPoint is already set to widget centre so we just
-        need to supply a plain scale+shear matrix."""
+        need to supply a plain scale+shear matrix.
+
+        Skips the QTransform construction entirely when drastic is idle
+        (values are identity) — saves ~30 QTransform builds/sec.
+        """
         if self._proxy is None:
             return
+        if not self._drastic_active and self._drastic_phase == 0:
+            return  # already at identity, skip
         t = QTransform()
         t.scale(self._drastic_sx, self._drastic_sy)
         t.shear(self._drastic_shx, self._drastic_shy)
@@ -1570,6 +1659,13 @@ class AIVoiceControlWidget(QWidget):
         self._right_upper_lashes = []
         self._left_lower_lashes = []
         self._right_lower_lashes = []
+
+        # Pen cache for lashes. Per-lash thickness varies continuously
+        # but quantising to 0.1 px is visually indistinguishable and
+        # collapses ~80 fresh QPen allocations per eye per frame to a
+        # ~5-entry dict lookup. Rebuilt on every agent switch so it
+        # never goes stale.
+        self._lash_pens = {}
 
         for i in range(n_upper):
             pos = i / max(n_upper - 1, 1)
@@ -1599,9 +1695,27 @@ class AIVoiceControlWidget(QWidget):
             ra = -(15 + 10 * math.sin(pos * math.pi)) + p.get("right_lash_angle_offset", 0)
             self._right_lower_lashes.append((rx, ln, ra, th))
 
+    def _lash_pen(self, thickness: float) -> QPen:
+        """Return a cached QPen for the given lash thickness.
+
+        Thicknesses are bucketed to 1 decimal place — within rendering
+        precision but collapses many distinct float values to a small
+        set of cached pen objects.
+        """
+        key = round(thickness, 1)
+        pen = self._lash_pens.get(key)
+        if pen is None:
+            pen = QPen(Qt.black, key, Qt.SolidLine, Qt.RoundCap)
+            self._lash_pens[key] = pen
+        return pen
+
     def _gen_iris_data(self):
         self._left_iris = self._make_iris()
         self._right_iris = self._make_iris()
+        # Invalidate iris pixmap caches so they regenerate from the
+        # new fiber/crypt/pupil patterns next paint.
+        self._left_iris_pixmap = None
+        self._right_iris_pixmap = None
 
     def _make_iris(self):
         d = {}
@@ -1626,19 +1740,139 @@ class AIVoiceControlWidget(QWidget):
             for _ in range(0, 360, 20)]
         return d
 
+    # ── Iris pixmap cache ───────────────────────────────────────────
+    #
+    # The iris is the single most expensive thing the paint event does:
+    # a radial gradient, 30 fiber lines (each with two trig calls), 8
+    # crypt ellipses, 18 pupil-edge points (each with trig), and 3
+    # catchlight ellipses, per eye, per frame. None of it changes once
+    # the agent is picked — only the iris center moves with the gaze.
+    #
+    # We render the iris ONCE into a QPixmap centered at (radius, radius)
+    # and then in paintEvent we drawPixmap at the gaze offset. The cache
+    # is invalidated on agent switch (via _gen_iris_data) and survives
+    # everything else: blinks, winks, flickers, tilts, mouse motion.
+    #
+    # The pixmap covers a 2*radius x 2*radius square and is drawn with
+    # transparent background, so the eye's clip path still works.
+
+    _IRIS_PIXMAP_PAD = 4   # pixels of padding to keep pupil edge anti-alias clean
+    _IRIS_R = 26           # matches the `ir = 26` used in the original draw
+
+    def _build_iris_pixmap(self, mirror: bool) -> 'QPixmap':
+        """Render a single eye's iris into a QPixmap, centered.
+
+        Returns a QPixmap of side 2*(_IRIS_R + _IRIS_PIXMAP_PAD). The
+        iris centre is at (R+PAD, R+PAD) inside the pixmap. The pixmap
+        has a transparent background; paintEvent will composite it
+        through the eye's clip path.
+
+        Drawn in widget-space scale (the painter.scale(scale_factor)
+        in paintEvent is unaware of this cache — the pixmap is
+        rendered at scale 1.0 in widget-internal coordinates and drawn
+        AFTER the scale transform is applied, so it appears at native
+        widget pixel density). We use the *display* device pixel ratio
+        so the cached image stays sharp on Retina/HiDPI panels.
+        """
+        from PySide6.QtGui import QPixmap
+
+        p = self._profile
+        ir = self._IRIS_R
+        pad = self._IRIS_PIXMAP_PAD
+        side = (ir + pad) * 2
+
+        # Device-pixel-ratio aware so we don't render a soft iris on
+        # HiDPI screens. The painter.scale(scale_factor) in paintEvent
+        # is independent of DPR.
+        dpr = self.devicePixelRatioF() if hasattr(self, 'devicePixelRatioF') else 1.0
+        pm = QPixmap(int(side * dpr), int(side * dpr))
+        pm.setDevicePixelRatio(dpr)
+        pm.fill(Qt.transparent)
+
+        painter = QPainter(pm)
+        painter.setRenderHint(QPainter.Antialiasing)
+
+        # Local centre inside the pixmap
+        icx = ir + pad
+        icy = ir + pad
+
+        iris_data = self._right_iris if mirror else self._left_iris
+        ic = p.get("right_iris_color", p["iris_color"]) if mirror else p["iris_color"]
+        irc = p.get("right_iris_rim_color", p["iris_rim_color"]) if mirror else p["iris_rim_color"]
+
+        # Iris body
+        grad = QRadialGradient(icx, icy, ir)
+        grad.setColorAt(0.0, ic.lighter(130))
+        grad.setColorAt(0.7, ic)
+        grad.setColorAt(1.0, irc)
+        painter.setBrush(QBrush(grad))
+        painter.setPen(QPen(irc.darker(130), 1.2))
+        painter.drawEllipse(QPointF(icx, icy), ir, ir)
+
+        # Fiber lines
+        painter.setPen(QPen(irc.darker(110), 0.3))
+        for ang, si, eo, co in iris_data['fibers']:
+            r = math.radians(ang)
+            painter.drawLine(
+                QPointF(icx + si * math.cos(r),
+                        icy + si * math.sin(r)),
+                QPointF(icx + eo * math.cos(r + co * 0.02),
+                        icy + eo * math.sin(r + co * 0.02)))
+
+        # Crypts
+        painter.setPen(Qt.NoPen)
+        painter.setBrush(QBrush(irc.darker(140)))
+        for cx_, cy_, sz in iris_data['crypts']:
+            painter.drawEllipse(QPointF(icx + cx_, icy + cy_), sz, sz)
+
+        # Pupil
+        pr = 8
+        pvars = iris_data['pupil_var']
+        pupil_pts = []
+        for i, ang in enumerate(range(0, 360, 20)):
+            v = pvars[i] if i < len(pvars) else 0
+            r = math.radians(ang)
+            pupil_pts.append(
+                QPointF(icx + (pr + v) * math.cos(r),
+                        icy + (pr + v) * math.sin(r)))
+        pp = QPainterPath()
+        if pupil_pts:
+            pp.moveTo(pupil_pts[0])
+            for pt in pupil_pts[1:]:
+                pp.lineTo(pt)
+            pp.closeSubpath()
+        painter.setPen(QPen(Qt.black, 1.5))
+        painter.setBrush(QBrush(Qt.black))
+        painter.drawPath(pp)
+
+        # Catchlights
+        painter.setBrush(QBrush(Qt.white))
+        painter.setPen(Qt.NoPen)
+        painter.drawEllipse(QPointF(icx - 6, icy - 5), 4, 5)
+        painter.drawEllipse(QPointF(icx + 4, icy - 7), 2, 2.5)
+        painter.drawEllipse(QPointF(icx - 2, icy + 6), 1, 1)
+
+        painter.end()
+        return pm
+
+    def _get_iris_pixmap(self, mirror: bool) -> 'QPixmap':
+        """Return the cached iris pixmap, building it on demand."""
+        if mirror:
+            if self._right_iris_pixmap is None:
+                self._right_iris_pixmap = self._build_iris_pixmap(mirror=True)
+            return self._right_iris_pixmap
+        else:
+            if self._left_iris_pixmap is None:
+                self._left_iris_pixmap = self._build_iris_pixmap(mirror=False)
+            return self._left_iris_pixmap
+
     # ── Iris position calc ───────────────────────────────────────────────
     def _iris_pos(self, eye_center):
-        cx, cy = 350, 225
-        dx = self.mouse_pos.x() - cx
-        dy = self.mouse_pos.y() - cy
-        dist = math.sqrt(dx * dx + dy * dy)
+        # Use the cached mouse-derived iris offset from _poll_mouse_internal
+        # instead of recomputing the same distance/direction calculation.
+        mouse_ix = getattr(self, '_mouse_iris_x', 0.0)
+        mouse_iy = getattr(self, '_mouse_iris_y', 0.0)
         mx = 18
-        if dist > 0:
-            f = min(dist / 150, 1.0)
-            mouse_ix = (dx / dist) * mx * f
-            mouse_iy = (dy / dist) * mx * f
-        else:
-            mouse_ix, mouse_iy = 0.0, 0.0
 
         # Blend autonomous gaze with mouse-driven gaze
         if self._gaze_mouse_active:
@@ -1687,9 +1921,11 @@ class AIVoiceControlWidget(QWidget):
         c = QColor(self._profile["label_color"])
         c.setAlphaF(self._label_opacity)
         painter.setPen(QPen(c, 1))
-        f = QFont("Helvetica Neue", 28, QFont.Weight.Light)
-        f.setLetterSpacing(QFont.AbsoluteSpacing, 8)
-        painter.setFont(f)
+        # Cached font — avoid recreating QFont every frame
+        if not hasattr(self, '_label_font'):
+            self._label_font = QFont("Helvetica Neue", 28, QFont.Weight.Light)
+            self._label_font.setLetterSpacing(QFont.AbsoluteSpacing, 8)
+        painter.setFont(self._label_font)
         rect = QRectF(0, 370, self._base_w, 60)
         label = self._profile["display_name"]
         if self._master_mode:
@@ -1697,21 +1933,126 @@ class AIVoiceControlWidget(QWidget):
         painter.drawText(rect, Qt.AlignHCenter | Qt.AlignTop, label)
         painter.restore()
 
+    def _build_eye_paths(self, center, mirror, bp, ebo):
+        """Build all QPainterPaths for one eye. Returns a dict of paths.
+
+        This is the expensive part that constructs ~7 QPainterPath objects
+        per eye. Results are cached by _get_eye_paths and only rebuilt
+        when the effective blink progress or eyebrow offset changes.
+        """
+        p = self._profile
+        x, y = center.x(), center.y()
+        mf = -1 if mirror else 1
+        ws = p["eye_width_scale"]
+        hs = p["eye_height_scale"]
+        ocl = p.get("outer_corner_lift", 0)
+        icd = p.get("inner_corner_drop", 0)
+        ulcb = p.get("upper_lid_curve_boost", 0)
+        neg75_adj = -ocl
+        pos75_adj = -icd
+
+        eff = self.eye_open_level * (1 - bp)
+        rest = (1.0 - eff) * 32 * hs
+        be = self._ease(bp)
+
+        nuy = -25 * hs
+        nly = 22 * hs
+        ulo = nuy + rest + ((55 * hs - rest) * be)
+        lr = rest * 0.25
+        lld = 12 * hs
+        llo = nly - lr - ((lld - lr) * be)
+        arch = p["eyebrow_arch"]
+
+        paths = {}
+        paths['ulo'] = ulo
+        paths['llo'] = llo
+        paths['neg75_adj'] = neg75_adj
+        paths['pos75_adj'] = pos75_adj
+        paths['ulcb'] = ulcb
+
+        # Eyebrow
+        brow = QPainterPath()
+        brow.moveTo(x - 78 * mf * ws, y - 58 + ebo)
+        brow.cubicTo(x - 20 * mf * ws, y - 82 + ebo - arch,
+                     x + 30 * mf * ws, y - 84 + ebo - arch,
+                     x + 78 * mf * ws, y - 52 + ebo)
+        paths['brow'] = brow
+
+        # Upper lid (also used as iris clip and lash base)
+        ul = QPainterPath()
+        ul.moveTo(x - 75 * mf * ws, y + 5 + neg75_adj)
+        ul.quadTo(x - 40 * mf * ws, y + ulo - ulcb,
+                  x - 5 * mf * ws, y + ulo - ulcb)
+        ul.quadTo(x + 30 * mf * ws, y + ulo - ulcb,
+                  x + 75 * mf * ws, y + 5 + pos75_adj)
+        paths['ul'] = ul
+
+        # Clip path (same shape as ul but closed via lower lid)
+        clip = QPainterPath()
+        clip.moveTo(x - 75 * mf * ws, y + 5 + neg75_adj)
+        clip.quadTo(x - 40 * mf * ws, y + ulo - ulcb,
+                    x - 5 * mf * ws, y + ulo - ulcb)
+        clip.quadTo(x + 30 * mf * ws, y + ulo - ulcb,
+                    x + 75 * mf * ws, y + 5 + pos75_adj)
+        clip.quadTo(x + 35 * mf * ws, y + llo,
+                    x + 5 * mf * ws, y + llo)
+        clip.quadTo(x - 25 * mf * ws, y + llo,
+                    x - 75 * mf * ws, y + 5 + neg75_adj)
+        clip.closeSubpath()
+        paths['clip'] = clip
+
+        # Lower lid line
+        ll_path = QPainterPath()
+        ll_path.moveTo(x - 75 * mf * ws, y + 5 + neg75_adj)
+        ll_path.quadTo(x - 25 * mf * ws, y + llo,
+                       x + 5 * mf * ws, y + llo)
+        ll_path.quadTo(x + 35 * mf * ws, y + llo,
+                       x + 75 * mf * ws, y + 5 + pos75_adj)
+        paths['ll'] = ll_path
+
+        # Tear duct
+        td = QPainterPath()
+        if not mirror:
+            td.moveTo(x - 75 * ws, y + 5 + neg75_adj)
+            td.quadTo(x - 85 * ws, y - 2 + neg75_adj,
+                      x - 75 * ws, y - 8 + neg75_adj)
+        else:
+            td.moveTo(x + 75 * ws, y + 5 + neg75_adj)
+            td.quadTo(x + 85 * ws, y - 2 + neg75_adj,
+                      x + 75 * ws, y - 8 + neg75_adj)
+        paths['td'] = td
+
+        # Lash span constants (used by upper lash drawing)
+        lid_start_x = x - 75 * mf * ws
+        lid_end_x = x + 75 * mf * ws
+        span_x = lid_end_x - lid_start_x
+        inv_span = 1.0 / span_x if abs(span_x) > 0.1 else 0.0
+        paths['lid_start_x'] = lid_start_x
+        paths['inv_span'] = inv_span
+
+        return paths
+
+    def _get_eye_paths(self, center, mirror, bp, ebo):
+        """Return cached eye paths, rebuilding only when inputs change."""
+        side = 'R' if mirror else 'L'
+        # Quantise bp and ebo to avoid rebuilds on sub-pixel changes
+        bp_q = round(bp, 3)
+        ebo_q = round(ebo, 1)
+        eol_q = round(self.eye_open_level, 2)
+        key = (side, bp_q, ebo_q, eol_q)
+        cached = self._cached_paths.get(side)
+        if cached is not None and cached[0] == key:
+            return cached[1]
+        paths = self._build_eye_paths(center, mirror, bp, ebo)
+        self._cached_paths[side] = (key, paths)
+        return paths
+
     def _draw_eye(self, painter, center, mirror=False):
         p = self._profile
         x, y = center.x(), center.y()
         mf = -1 if mirror else 1
         ws = p["eye_width_scale"]
         hs = p["eye_height_scale"]
-
-        # Corner shaping — lift outer corners, drop inner for curved-up look
-        ocl = p.get("outer_corner_lift", 0)   # outer corner lift (pos = up)
-        icd = p.get("inner_corner_drop", 0)   # inner corner drop (neg = down)
-        ulcb = p.get("upper_lid_curve_boost", 0)  # extra upper lid curve
-
-        # Confirmed via debug dots: -75*mf = OUTER corner, +75*mf = INNER corner
-        neg75_adj = -ocl    # outer corner at -75*mf: lift up
-        pos75_adj = -icd    # inner corner at +75*mf: drop down
 
         bp = self.blink_progress
         if self.is_winking:
@@ -1722,33 +2063,28 @@ class AIVoiceControlWidget(QWidget):
         if self._auto_blink_phase > 0:
             bp = max(bp, self._auto_blink_progress)
 
-        eff = self.eye_open_level * (1 - bp)
-        rest = (1.0 - eff) * 32 * hs
-        be = self._ease(bp)
         is_closed = bp >= 0.99
+        ebo = self.eyebrow_offset + p["eyebrow_y_offset"]
 
-        nuy = -25 * hs
-        nly = 22 * hs
-        ulo = nuy + rest + ((55 * hs - rest) * be)
-        lr = rest * 0.25
-        lld = 12 * hs
-        llo = nly - lr - ((lld - lr) * be)
+        # Fetch cached paths (rebuilds only when bp/ebo/eye_open_level change)
+        eye_paths = self._get_eye_paths(center, mirror, bp, ebo)
+        ulo = eye_paths['ulo']
+        llo = eye_paths['llo']
+        neg75_adj = eye_paths['neg75_adj']
+        pos75_adj = eye_paths['pos75_adj']
+        ulcb = eye_paths['ulcb']
 
         # ── Eyebrow — single clean curved line ──────────────────────────
-        ebo = self.eyebrow_offset + p["eyebrow_y_offset"]
-        arch = p["eyebrow_arch"]
         brow_pen = QPen(Qt.black, p["eyebrow_thickness"],
                         Qt.SolidLine, Qt.RoundCap)
-        brow = QPainterPath()
-        brow.moveTo(x - 78 * mf * ws, y - 58 + ebo)
-        brow.cubicTo(x - 20 * mf * ws, y - 82 + ebo - arch,
-                     x + 30 * mf * ws, y - 84 + ebo - arch,
-                     x + 78 * mf * ws, y - 52 + ebo)
-        pen, draw = self._intro_pen(brow_pen, brow, 0.0, 0.35)
+        if self._intro_playing:
+            pen, draw = self._intro_pen(brow_pen, eye_paths['brow'], 0.0, 0.35)
+        else:
+            pen, draw = brow_pen, True
         if draw:
             painter.setPen(pen)
             painter.setBrush(Qt.NoBrush)
-            painter.drawPath(brow)
+            painter.drawPath(eye_paths['brow'])
 
         # ── Iris / pupil ─────────────────────────────────────────────────
         iris_alpha = self._intro_opacity(0.30, 0.55)
@@ -1757,17 +2093,7 @@ class AIVoiceControlWidget(QWidget):
             icx = x + ix
             icy = y - 10 + iy
 
-            clip = QPainterPath()
-            clip.moveTo(x - 75 * mf * ws, y + 5 + neg75_adj)
-            clip.quadTo(x - 40 * mf * ws, y + ulo - ulcb,
-                        x - 5 * mf * ws, y + ulo - ulcb)
-            clip.quadTo(x + 30 * mf * ws, y + ulo - ulcb,
-                        x + 75 * mf * ws, y + 5 + pos75_adj)
-            clip.quadTo(x + 35 * mf * ws, y + llo,
-                        x + 5 * mf * ws, y + llo)
-            clip.quadTo(x - 25 * mf * ws, y + llo,
-                        x - 75 * mf * ws, y + 5 + neg75_adj)
-            clip.closeSubpath()
+            clip = eye_paths['clip']
 
             painter.save()
             painter.setClipPath(clip)
@@ -1778,75 +2104,29 @@ class AIVoiceControlWidget(QWidget):
             painter.setBrush(QBrush(QColor(255, 255, 252)))
             painter.drawPath(clip)
 
-            iris_data = self._left_iris if not mirror else self._right_iris
-
-            # Iris
-            ir = 26
-            ic = p.get("right_iris_color", p["iris_color"]) if mirror else p["iris_color"]
-            irc = p.get("right_iris_rim_color", p["iris_rim_color"]) if mirror else p["iris_rim_color"]
-            grad = QRadialGradient(icx, icy, ir)
-            grad.setColorAt(0.0, ic.lighter(130))
-            grad.setColorAt(0.7, ic)
-            grad.setColorAt(1.0, irc)
-            painter.setBrush(QBrush(grad))
-            painter.setPen(QPen(irc.darker(130), 1.2))
-            painter.drawEllipse(QPointF(icx, icy), ir, ir)
-
-            # Fiber lines
-            painter.setPen(QPen(irc.darker(110), 0.3))
-            for ang, si, eo, co in iris_data['fibers']:
-                r = math.radians(ang)
-                painter.drawLine(
-                    QPointF(icx + si * math.cos(r),
-                            icy + si * math.sin(r)),
-                    QPointF(icx + eo * math.cos(r + co * 0.02),
-                            icy + eo * math.sin(r + co * 0.02)))
-
-            # Crypts
-            painter.setPen(Qt.NoPen)
-            painter.setBrush(QBrush(irc.darker(140)))
-            for cx_, cy_, sz in iris_data['crypts']:
-                painter.drawEllipse(
-                    QPointF(icx + cx_, icy + cy_), sz, sz)
-
-            # Pupil
-            pr = 8
-            pvars = iris_data['pupil_var']
-            pupil_pts = []
-            for i, ang in enumerate(range(0, 360, 20)):
-                v = pvars[i] if i < len(pvars) else 0
-                r = math.radians(ang)
-                pupil_pts.append(
-                    QPointF(icx + (pr + v) * math.cos(r),
-                            icy + (pr + v) * math.sin(r)))
-            pp = QPainterPath()
-            if pupil_pts:
-                pp.moveTo(pupil_pts[0])
-                for pt in pupil_pts[1:]:
-                    pp.lineTo(pt)
-                pp.closeSubpath()
-            painter.setPen(QPen(Qt.black, 1.5))
-            painter.setBrush(QBrush(Qt.black))
-            painter.drawPath(pp)
-
-            # Catchlights
-            painter.setBrush(QBrush(Qt.white))
-            painter.setPen(Qt.NoPen)
-            painter.drawEllipse(QPointF(icx - 6, icy - 5), 4, 5)
-            painter.drawEllipse(QPointF(icx + 4, icy - 7), 2, 2.5)
-            painter.drawEllipse(QPointF(icx - 2, icy + 6), 1, 1)
+            # Iris/pupil/catchlights are pre-rendered into a QPixmap
+            # (per agent, per mirror). One drawPixmap replaces ~50 draw
+            # calls + ~60 trig calls that the old code did per frame.
+            # The cache invalidates on agent switch via _gen_iris_data.
+            iris_pm = self._get_iris_pixmap(mirror)
+            pad = self._IRIS_PIXMAP_PAD
+            ir = self._IRIS_R
+            # The pixmap's centre is at (ir+pad, ir+pad); place it so
+            # that centre lands at (icx, icy).
+            painter.drawPixmap(
+                QPointF(icx - (ir + pad), icy - (ir + pad)),
+                iris_pm,
+            )
 
             painter.restore()
 
         # ── Upper eyelid ─────────────────────────────────────────────────
         lid_pen = QPen(Qt.black, p["lid_thickness"])
-        ul = QPainterPath()
-        ul.moveTo(x - 75 * mf * ws, y + 5 + neg75_adj)
-        ul.quadTo(x - 40 * mf * ws, y + ulo - ulcb,
-                  x - 5 * mf * ws, y + ulo - ulcb)
-        ul.quadTo(x + 30 * mf * ws, y + ulo - ulcb,
-                  x + 75 * mf * ws, y + 5 + pos75_adj)
-        pen, draw = self._intro_pen(lid_pen, ul, 0.05, 0.45)
+        ul = eye_paths['ul']
+        if self._intro_playing:
+            pen, draw = self._intro_pen(lid_pen, ul, 0.05, 0.45)
+        else:
+            pen, draw = lid_pen, True
         if draw:
             painter.setPen(pen)
             painter.setBrush(Qt.NoBrush)
@@ -1862,19 +2142,18 @@ class AIVoiceControlWidget(QWidget):
             painter.save()
             painter.setOpacity(painter.opacity() * lash_alpha)
 
-            # Build the same upper lid path used for drawing, so we can
-            # sample exact points with pointAtPercent().
-            _lid = QPainterPath()
-            _lid.moveTo(x - 75 * mf * ws, y + 5 + neg75_adj)
-            _lid.quadTo(x - 40 * mf * ws, y + ulo - ulcb,
-                        x - 5 * mf * ws, y + ulo - ulcb)
-            _lid.quadTo(x + 30 * mf * ws, y + ulo - ulcb,
-                        x + 75 * mf * ws, y + 5 + pos75_adj)
+            # Reuse the cached upper-lid path
+            _lid = ul
             _lid_len = _lid.length()
 
+            # Use pre-computed span constants from the cached paths
+            lid_start_x = eye_paths['lid_start_x']
+            inv_span = eye_paths['inv_span']
+
             for lx, ll, la, lt in lashes:
-                painter.setPen(
-                    QPen(Qt.black, lt, Qt.SolidLine, Qt.RoundCap))
+                # Cached pen by rounded thickness — was creating a fresh
+                # QPen per lash, ~80 allocations per eye per frame.
+                painter.setPen(self._lash_pen(lt))
                 # Map lash x-position to a percent along the lid path.
                 # lx is in "left-eye space" (-70..+70 roughly).
                 # The lid path starts at x - 75*mf*ws and ends at
@@ -1884,24 +2163,23 @@ class AIVoiceControlWidget(QWidget):
                 # the lash in world space: x + lx*ws, then find which
                 # percent along the lid has that x.
                 lash_world_x = x + lx * ws
-                lid_start_x = x - 75 * mf * ws
-                lid_end_x = x + 75 * mf * ws
-                span_x = lid_end_x - lid_start_x
-                if abs(span_x) > 0.1:
+                if inv_span:
                     pct = max(0.0, min(1.0,
-                              (lash_world_x - lid_start_x) / span_x))
+                              (lash_world_x - lid_start_x) * inv_span))
                 else:
                     pct = 0.5
                 sp = _lid.pointAtPercent(pct)
                 rad = math.radians(la)
-                ep = QPointF(sp.x() + ll * math.sin(rad),
-                             sp.y() - ll * math.cos(rad) * y_flip)
+                sin_rad = math.sin(rad)
+                cos_rad = math.cos(rad)
+                lash_ep = QPointF(sp.x() + ll * sin_rad,
+                             sp.y() - ll * cos_rad * y_flip)
                 cp = QPointF(
-                    sp.x() + ll * 0.5 * math.sin(rad) * y_flip,
+                    sp.x() + ll * 0.5 * sin_rad * y_flip,
                     sp.y() - ll * 0.5 * math.cos(
                         rad - 0.8 * mf) * y_flip)
                 lp = QPainterPath(sp)
-                lp.quadTo(cp, ep)
+                lp.quadTo(cp, lash_ep)
                 painter.drawPath(lp)
             painter.restore()
 
@@ -1914,48 +2192,43 @@ class AIVoiceControlWidget(QWidget):
             lo_lashes = (self._right_lower_lashes if mirror
                          else self._left_lower_lashes)
             for lx, ll, la, lt in lo_lashes:
-                painter.setPen(
-                    QPen(Qt.black, lt, Qt.SolidLine, Qt.RoundCap))
+                # Cached pen — see upper-lash comment.
+                painter.setPen(self._lash_pen(lt))
                 nx = lx / (75 * abs(mf) * ws)
                 sy = (y + llo) + (y + 5 - (y + llo)) * nx * nx
                 sp = QPointF(x + lx * ws, sy)
                 rad = math.radians(la)
-                ep = QPointF(sp.x() - ll * math.sin(rad),
-                             sp.y() + ll * math.cos(rad))
+                sin_rad = math.sin(rad)
+                cos_rad = math.cos(rad)
+                lash_ep = QPointF(sp.x() - ll * sin_rad,
+                             sp.y() + ll * cos_rad)
                 cp = QPointF(
                     sp.x() + ll * 0.5 * math.sin(rad - 1 * mf),
                     sp.y() + ll * 0.5 * math.cos(
                         rad - 0.1 * mf))
                 lp = QPainterPath(sp)
-                lp.quadTo(cp, ep)
+                lp.quadTo(cp, lash_ep)
                 painter.drawPath(lp)
 
-            # Lower lid line
+            # Lower lid line (cached path)
             lower_lid_pen = QPen(Qt.black, p["lower_lid_thickness"])
-            ll_path = QPainterPath()
-            ll_path.moveTo(x - 75 * mf * ws, y + 5 + neg75_adj)
-            ll_path.quadTo(x - 25 * mf * ws, y + llo,
-                           x + 5 * mf * ws, y + llo)
-            ll_path.quadTo(x + 35 * mf * ws, y + llo,
-                           x + 75 * mf * ws, y + 5 + pos75_adj)
-            pen, draw = self._intro_pen(lower_lid_pen, ll_path, 0.35, 0.65)
+            ll_path = eye_paths['ll']
+            if self._intro_playing:
+                pen, draw = self._intro_pen(lower_lid_pen, ll_path, 0.35, 0.65)
+            else:
+                pen, draw = lower_lid_pen, True
             if draw:
                 painter.setPen(pen)
                 painter.setBrush(Qt.NoBrush)
                 painter.drawPath(ll_path)
 
-            # Tear duct
-            td = QPainterPath()
-            if not mirror:
-                td.moveTo(x - 75 * ws, y + 5 + neg75_adj)
-                td.quadTo(x - 85 * ws, y - 2 + neg75_adj,
-                          x - 75 * ws, y - 8 + neg75_adj)
-            else:
-                td.moveTo(x + 75 * ws, y + 5 + neg75_adj)
-                td.quadTo(x + 85 * ws, y - 2 + neg75_adj,
-                          x + 75 * ws, y - 8 + neg75_adj)
+            # Tear duct (cached path)
+            td = eye_paths['td']
             td_pen = QPen(Qt.black, p["lower_lid_thickness"])
-            pen, draw = self._intro_pen(td_pen, td, 0.45, 0.70)
+            if self._intro_playing:
+                pen, draw = self._intro_pen(td_pen, td, 0.45, 0.70)
+            else:
+                pen, draw = td_pen, True
             if draw:
                 painter.setPen(pen)
                 painter.drawPath(td)

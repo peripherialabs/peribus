@@ -120,31 +120,78 @@ class StatementAnalyzer:
         
         # --- Assignments ---
         elif isinstance(node, ast.Assign):
-            stmt.kind = "assign"
-            for target in node.targets:
-                self._extract_assigned_names(target, stmt.defines)
-            self._extract_all_reads(node.value, stmt.reads)
+            # `obj.attr = value` and `obj[k] = value` mutate `obj`; they
+            # don't define a new top-level name.  Classifying them as
+            # `assign` poisons name_to_latest — a later `social_widget.x = ...`
+            # would shadow the real `social_widget = SocialMediaExplorer()`
+            # and the constructor call gets pruned, breaking re-execution.
+            # Treat pure attribute/subscript targets as a side-effect on
+            # the root object instead.
+            if all(isinstance(t, (ast.Attribute, ast.Subscript))
+                   for t in node.targets):
+                stmt.kind = "side_effect"
+                for target in node.targets:
+                    root = self._get_attr_or_subscript_root(target)
+                    if root:
+                        stmt.targets.add(root)
+                        stmt.reads.add(root)
+                self._extract_all_reads(node.value, stmt.reads)
+            else:
+                stmt.kind = "assign"
+                for target in node.targets:
+                    self._extract_assigned_names(target, stmt.defines)
+                self._extract_all_reads(node.value, stmt.reads)
         
         elif isinstance(node, ast.AugAssign):
-            stmt.kind = "assign"
-            self._extract_assigned_names(node.target, stmt.defines)
-            self._extract_all_reads(node.value, stmt.reads)
+            # Same logic for `obj.attr += 1` and `obj[k] += 1`.
+            if isinstance(node.target, (ast.Attribute, ast.Subscript)):
+                stmt.kind = "side_effect"
+                root = self._get_attr_or_subscript_root(node.target)
+                if root:
+                    stmt.targets.add(root)
+                    stmt.reads.add(root)
+                self._extract_all_reads(node.value, stmt.reads)
+            else:
+                stmt.kind = "assign"
+                self._extract_assigned_names(node.target, stmt.defines)
+                self._extract_all_reads(node.value, stmt.reads)
         
         elif isinstance(node, ast.AnnAssign):
-            stmt.kind = "assign"
-            if node.target:
-                self._extract_assigned_names(node.target, stmt.defines)
-            if node.value:
-                self._extract_all_reads(node.value, stmt.reads)
+            # `obj.attr: T = v` and `obj[k]: T = v` likewise.
+            if isinstance(node.target, (ast.Attribute, ast.Subscript)):
+                stmt.kind = "side_effect"
+                root = self._get_attr_or_subscript_root(node.target)
+                if root:
+                    stmt.targets.add(root)
+                    stmt.reads.add(root)
+                if node.value:
+                    self._extract_all_reads(node.value, stmt.reads)
+            else:
+                stmt.kind = "assign"
+                if node.target:
+                    self._extract_assigned_names(node.target, stmt.defines)
+                if node.value:
+                    self._extract_all_reads(node.value, stmt.reads)
         
         # --- Function/Class defs ---
         elif isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)):
             stmt.kind = "assign"
             stmt.defines.add(node.name)
+            # Walk the entire body for reads so that imports used only
+            # inside function bodies (e.g. `import colorsys` used in a
+            # helper function) survive the pruning pass.  Without this,
+            # step 6's "prune imports not referenced by any live
+            # statement" kills them — the CONTEXT output is then broken
+            # when re-executed in a fresh namespace (/share scene).
+            self._extract_all_reads(node, stmt.reads)
         
         elif isinstance(node, ast.ClassDef):
             stmt.kind = "assign"
             stmt.defines.add(node.name)
+            # Same: walk class body for reads.  A class that uses
+            # `colorsys.hsv_to_rgb()` in its paintEvent must keep
+            # `import colorsys` alive in the compacted output.
+            self._extract_all_reads(node, stmt.reads)
         
         # --- Expression statements (side effects) ---
         elif isinstance(node, ast.Expr):
@@ -188,10 +235,11 @@ class StatementAnalyzer:
                 self._extract_assigned_names(elt, names)
         elif isinstance(target, ast.Starred):
             self._extract_assigned_names(target.value, names)
-        elif isinstance(target, ast.Attribute):
-            root = self._get_attr_root(target)
-            if root:
-                names.add(root)
+        # NOTE: ast.Attribute / ast.Subscript intentionally NOT handled here.
+        # `obj.attr = ...` and `obj[k] = ...` mutate obj, they don't define it.
+        # Pure attr/subscript Assigns are reclassified as `side_effect` upstream;
+        # mixed targets (e.g. `x = obj.y = 5`) still record the Name targets
+        # but skip the attribute roots so they don't poison name_to_latest.
     
     def _extract_all_reads(self, node: ast.AST, reads: Set[str]):
         for child in ast.walk(node):
@@ -210,6 +258,17 @@ class StatementAnalyzer:
     
     def _get_attr_root(self, node) -> Optional[str]:
         while isinstance(node, ast.Attribute):
+            node = node.value
+        if isinstance(node, ast.Name):
+            return node.id
+        return None
+    
+    def _get_attr_or_subscript_root(self, node) -> Optional[str]:
+        """Walk both Attribute and Subscript chains down to the base Name.
+        
+        e.g. `a.b[0].c` → "a", `d['k']` → "d", `e[0][1]` → "e".
+        """
+        while isinstance(node, (ast.Attribute, ast.Subscript)):
             node = node.value
         if isinstance(node, ast.Name):
             return node.id
@@ -430,12 +489,43 @@ def create_smart_context_file_class(SyntheticFile):
         Inherits SyntheticFile so it has qid, stat, and all 9P plumbing.
         """
         
+        # Modules that parser.py / _build_inline_python_namespace pre-seed
+        # into the execution namespace.  These don't need explicit import
+        # lines in the CONTEXT output because the renderer's namespace
+        # already provides them.  Everything NOT in this set must have an
+        # import statement emitted or the shared scene will break.
+        _PRESEEDED = frozenset({
+            # QtWidgets classes are dumped individually, not as a module
+            # import — but the module objects themselves are seeded:
+            'QtWidgets', 'QtCore', 'QtGui',
+            # Explicit cherry-picks from QtCore / QtGui:
+            'Qt', 'QTimer', 'QRect', 'QRectF', 'QPoint', 'QPointF',
+            'QSize', 'QSizeF', 'Signal', 'Slot',
+            'QColor', 'QBrush', 'QPen', 'QFont', 'QPixmap', 'QImage',
+            'QPainter',
+            # Optional:
+            'QWebEngineView',
+            # Math helpers (seeded as bare names, not as `math` module):
+            'sin', 'cos', 'tan', 'sqrt', 'pi', 'e',
+            # Modules seeded by name:
+            'asyncio', 'np', 'numpy', 'pd', 'pandas',
+            'json', 'os', 'sys',
+            # Scene/window bindings:
+            'scene_manager', 'main_window', 'graphics_scene',
+            'graphics_view',
+        })
+        
         def __init__(self):
             super().__init__("CONTEXT")
             
             self._code_blocks: TList[str] = []
             self._compactor = CodeCompactor()
             self._cached: Optional[str] = None
+            
+            # Imports observed in the live namespace that weren't part
+            # of the pre-seeded set.  Stored as source lines so they
+            # can be injected into the compacted output.
+            self._namespace_imports: TList[str] = []
             
             self._content_ready = asyncio.Event()
             self._content_consumed = False
@@ -447,11 +537,79 @@ def create_smart_context_file_class(SyntheticFile):
                 self._code_blocks.append(code.rstrip() + "\n")
                 self._cached = None
                 self._content_ready.set()
+
+        def clear(self):
+            """
+            Wipe all accumulated code and reset the file to its initial state.
+
+            Called when the user clears the scene — the CONTEXT file should
+            no longer report any code blocks, and the next read should see
+            an empty file. Any blocked readers waiting on _content_ready are
+            released so they can return EOF on the now-empty content.
+            """
+            self._code_blocks.clear()
+            self._namespace_imports = []
+            self._cached = None
+            # Wake any blocked readers; they'll see empty content and EOF.
+            self._content_ready.set()
+            self._content_consumed = False
+
+        def notify_namespace_imports(self, namespace: dict):
+            """
+            Scan the execution namespace for imported modules and record
+            any that aren't part of the pre-seeded set.
+            
+            Called by the executor after successful code execution (same
+            place that calls append_code).  The namespace dict is the
+            live exec namespace — we look for module objects and
+            reconstruct the import lines needed to reproduce them.
+            
+            This closes the gap where code does `import random` in one
+            block and uses `random.choice(...)` in a later block that
+            doesn't re-import.  The compactor sees the usage but might
+            not see the import if it was in a block whose other
+            definitions were superseded (and thus pruned).
+            """
+            import types
+            lines = []
+            for name, obj in namespace.items():
+                if name.startswith('_'):
+                    continue
+                if name in self._PRESEEDED:
+                    continue
+                if isinstance(obj, types.ModuleType):
+                    mod_name = getattr(obj, '__name__', name)
+                    if name == mod_name or name == mod_name.split('.')[-1]:
+                        lines.append(f"import {mod_name}")
+                    else:
+                        # aliased: import foo as bar
+                        lines.append(f"import {mod_name} as {name}")
+            if lines != self._namespace_imports:
+                self._namespace_imports = lines
+                self._cached = None
         
         def get_all_code(self) -> str:
-            """Return compacted code representing current effective state."""
+            """Return compacted code representing current effective state.
+            
+            Injects any namespace-level imports that aren't already
+            present in the compacted output.  This guarantees that
+            `/share scene` produces a self-contained script.
+            """
             if self._cached is None:
-                self._cached = self._compactor.compact(self._code_blocks)
+                compacted = self._compactor.compact(self._code_blocks)
+                
+                # Inject namespace imports that the compactor missed
+                if self._namespace_imports and compacted:
+                    existing = set(compacted.splitlines())
+                    missing = [
+                        line for line in self._namespace_imports
+                        if line not in existing
+                    ]
+                    if missing:
+                        # Prepend to the import block at the top
+                        compacted = '\n'.join(missing) + '\n' + compacted
+                
+                self._cached = compacted
             return self._cached
         
         def get_raw_code(self) -> str:
@@ -673,6 +831,153 @@ def test_full_example():
     print("✓ test_full_example")
 
 
+def test_import_in_class_body():
+    """Import used only inside a class body must survive pruning.
+    
+    This was the main /share scene bug: `import colorsys` would be
+    pruned because _classify for ClassDef never called
+    _extract_all_reads, so `colorsys` never appeared in any
+    statement's `reads` set.
+    """
+    c = CodeCompactor()
+    result = c.compact([textwrap.dedent("""\
+        import colorsys
+        
+        class HueWheel(QWidget):
+            def paintEvent(self, event):
+                r, g, b = colorsys.hsv_to_rgb(0.5, 1.0, 1.0)
+                painter = QPainter(self)
+                painter.fillRect(self.rect(), QColor(int(r*255), int(g*255), int(b*255)))
+        
+        wheel = HueWheel()
+        proxy = graphics_scene.addWidget(wheel)
+    """)])
+    assert "import colorsys" in result, (
+        f"import colorsys was pruned! Output:\n{result}"
+    )
+    assert "class HueWheel" in result
+    print("✓ test_import_in_class_body")
+
+
+def test_import_in_function_body():
+    """Import used only inside a function body must survive pruning."""
+    c = CodeCompactor()
+    result = c.compact([textwrap.dedent("""\
+        import random
+        
+        def pick_color():
+            return random.choice(['red', 'blue', 'green'])
+        
+        color = pick_color()
+    """)])
+    assert "import random" in result, (
+        f"import random was pruned! Output:\n{result}"
+    )
+    assert "def pick_color" in result
+    print("✓ test_import_in_function_body")
+
+
+def test_namespace_import_injection():
+    """Imports from the live namespace that never appeared in code blocks
+    should be injected into the CONTEXT output.
+    
+    Scenario: user types `>>> import random` in block 1, then in block 2
+    writes code using `random.choice(...)` without re-importing.  Block 1
+    gets superseded by later redefinitions and pruned, but `random` is
+    still in the live namespace.  notify_namespace_imports() catches this.
+    """
+    import types
+    
+    # Minimal SyntheticFile stub for testing
+    class FakeSyntheticFile:
+        def __init__(self, name): pass
+    
+    SmartContextFile = create_smart_context_file_class(FakeSyntheticFile)
+    ctx = SmartContextFile()
+    
+    # Block 1: just an import + a variable that will be superseded
+    ctx.append_code("import random\nx = 1\n")
+    # Block 2: supersedes x, uses random but doesn't re-import
+    ctx.append_code("x = random.choice([1,2,3])\n")
+    
+    # Simulate the executor calling notify_namespace_imports with the
+    # live namespace containing the random module
+    ctx.notify_namespace_imports({
+        'random': types.ModuleType('random'),
+        'os': types.ModuleType('os'),       # pre-seeded, should be skipped
+        'sys': types.ModuleType('sys'),      # pre-seeded, should be skipped
+        'x': 2,                              # not a module, should be skipped
+    })
+    
+    result = ctx.get_all_code()
+    assert "import random" in result, (
+        f"import random missing from CONTEXT! Output:\n{result}"
+    )
+    assert "x = random.choice" in result
+    # Pre-seeded modules should NOT appear as explicit imports
+    assert "import os\n" not in result or "import os" in result  # os might come from code
+    print("✓ test_namespace_import_injection")
+
+
+def test_attribute_assignment_does_not_shadow_real_assignment():
+    """`obj.attr = ...` must not be classified as defining `obj`.
+    
+    Regression: a single block containing both
+        widget = SomeClass()
+        widget.callback = my_func        # monkeypatch
+    used to drop the constructor call.  `_extract_assigned_names` was
+    adding the attribute root ("widget") to `defines`, so the later
+    monkeypatch became name_to_latest['widget'], which made the real
+    assignment non-live and got pruned.  Reinjecting the compacted
+    output then raised NameError: name 'widget' is not defined.
+    """
+    c = CodeCompactor()
+    result = c.compact(["""
+class Thing:
+    def __init__(self): pass
+
+widget = Thing()
+widget.callback = lambda: None
+widget.do_thing()
+"""])
+    assert "widget = Thing()" in result, (
+        f"widget = Thing() was pruned by attribute monkeypatch! Output:\n{result}"
+    )
+    assert "widget.callback = lambda: None" in result
+    print("✓ test_attribute_assignment_does_not_shadow_real_assignment")
+
+
+def test_subscript_assignment_does_not_shadow():
+    """Same for `d[k] = v` — must not define `d`."""
+    c = CodeCompactor()
+    result = c.compact(["""
+config = {}
+config['debug'] = True
+config['port'] = 8080
+"""])
+    assert "config = {}" in result, (
+        f"config = {{}} was pruned by subscript assignment! Output:\n{result}"
+    )
+    assert "config['debug'] = True" in result
+    assert "config['port'] = 8080" in result
+    print("✓ test_subscript_assignment_does_not_shadow")
+
+
+def test_aug_assign_on_attribute_does_not_shadow():
+    """And `obj.attr += 1`."""
+    c = CodeCompactor()
+    result = c.compact(["""
+class Counter:
+    def __init__(self): self.n = 0
+
+c = Counter()
+c.n += 1
+"""])
+    assert "c = Counter()" in result, f"c = Counter() pruned! Output:\n{result}"
+    assert "c.n += 1" in result
+    print("✓ test_aug_assign_on_attribute_does_not_shadow")
+
+
 if __name__ == "__main__":
     test_basic_compaction()
     test_import_merging()
@@ -681,4 +986,10 @@ if __name__ == "__main__":
     test_control_flow_dedup()
     test_unused_import_pruning()
     test_full_example()
+    test_import_in_class_body()
+    test_import_in_function_body()
+    test_namespace_import_injection()
+    test_attribute_assignment_does_not_shadow_real_assignment()
+    test_subscript_assignment_does_not_shadow()
+    test_aug_assign_on_attribute_does_not_shadow()
     print("\n✅ All tests passed!")

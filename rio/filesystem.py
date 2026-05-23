@@ -45,6 +45,18 @@ from core.types import FidState
 from .scene import SceneManager, SceneItem
 from .parser import Executor, ExecutionContext, StreamingParser
 from .context_file import create_smart_context_file_class
+from .quick_file import QuickFile
+
+# Cross-machine signals — exposed under /scene/signals/. The Signal
+# factory and subscribe/unsubscribe entry points live in rio.signals;
+# the parser injects them into the user namespace, so this import is
+# only needed for the 9P dir + bus_getter.
+try:
+    from .signals_fs import SignalsDir
+    from .signals import _global_bus as _rio_signals_bus
+    _HAS_SIGNALS = True
+except ImportError:
+    _HAS_SIGNALS = False
 
 
 class RioCtlHandler(CtlHandler):
@@ -468,11 +480,26 @@ class ParseFile(SyntheticFile):
         self._fid_decoders = {}  # incremental UTF-8 decoders per fid
     
     async def read(self, fid: FidState, offset: int, count: int) -> bytes:
+        # If this fid has un-flushed bytes mid-write, surface that —
+        # returning CONTEXT here would be misleading since it doesn't
+        # yet reflect the in-progress block.
         parser = self._fid_parsers.get(fid.fid)
         if parser and parser.has_content():
-            return b"buffering...\n"
-        return b"ready\n"
-    
+            data = b"buffering...\n"
+            return data[offset:offset + count]
+
+        # One-shot, non-blocking view of the compacted CONTEXT.
+        # Same content as `cat /n/<machine>/CONTEXT`, but reads here
+        # never block waiting for new code to land.  Empty CONTEXT
+        # → empty read (immediate EOF).
+        if self.context_file is None:
+            return b""
+        content = self.context_file.get_all_code()
+        if not content:
+            return b""
+        data = content.encode()
+        return data[offset:offset + count]
+
     async def write(self, fid: FidState, offset: int, data: bytes) -> int:
         try:
             if fid.fid not in self._fid_parsers:
@@ -525,7 +552,16 @@ class ParseFile(SyntheticFile):
             print(f"{'='*60}\n")
             
             asyncio.create_task(self._execute_code(code))
-    
+
+    def dispatch(self, code: str):
+        """
+        Internal shortcut — execute code directly without going through
+        the 9P write/clunk cycle. Used by QuickFile and other internal
+        callers that generate code programmatically.
+        """
+        if code and code.strip():
+            asyncio.create_task(self._execute_code(code))
+
     async def _execute_code(self, code: str):
         """Execute code with output capture"""
         # Clear previous execution state
@@ -1021,8 +1057,16 @@ class TerminalOutputFile(SyntheticFile):
         
         text = data.decode('utf-8', errors='replace')
         if text:
-            # Display in the terminal widget (must run on Qt thread)
-            terminal._on_fs_output(text)
+            # Display in the terminal widget (must run on Qt thread).
+            # The fid-derived source key gives each open file handle its
+            # own fence parser, so two concurrent producers writing fenced
+            # blocks (e.g. two agents both routed to $term/output) cannot
+            # corrupt each other's state. Older terminals that don't
+            # accept the source_key kwarg fall back to the unkeyed call.
+            try:
+                terminal._on_fs_output(text, source_key=f"fs:{fid.fid}")
+            except TypeError:
+                terminal._on_fs_output(text)
             # Also feed the blocking monitoring tap
             await self.post(data)
         
@@ -1076,6 +1120,28 @@ class TerminalOutputFile(SyntheticFile):
                 self._content_consumed = True
             
             return chunk
+    
+    def clunk(self, fid: FidState):
+        """Finalize the per-fid stream when this file handle closes.
+        
+        If a writer disconnected mid-fence, this lets the terminal widget
+        force-close the inline widget so it stops showing as 'streaming'.
+        Best-effort: if the terminal is gone or doesn't expose the hook,
+        we silently ignore.
+        """
+        terminal = self._terminal_ref()
+        if terminal is None:
+            return
+        # Bounce to Qt main thread; the router itself isn't thread-safe.
+        try:
+            from PySide6.QtCore import QMetaObject, Qt as _Qt, Q_ARG
+            QMetaObject.invokeMethod(
+                terminal, "_route_stream_eof",
+                _Qt.QueuedConnection,
+                Q_ARG(str, f"fs:{fid.fid}"),
+            )
+        except Exception:
+            pass
 
 
 class TerminalInterruptFile(SyntheticFile):
@@ -1108,6 +1174,773 @@ class TerminalInterruptFile(SyntheticFile):
         except (OSError, ProcessLookupError):
             pass
         return len(data)
+
+
+class TerminalInlineFile(SyntheticFile):
+    """
+    Write here to render a media widget inline in the terminal output.
+    
+    /n/rioa/terms/<term_id>/inline
+    
+    Three input formats are auto-detected:
+    
+    1. **Path** (one line, valid existing file path):
+    
+           echo /tmp/result.png  > $inline
+           echo /tmp/anim.gif    > $inline   # auto-loops
+           echo /tmp/song.mp3    > $inline   # mini player
+           echo /tmp/clip.mp4    > $inline   # video player
+           echo /tmp/doc.pdf     > $inline   # PDF scroll view
+           echo /tmp/mesh.obj    > $inline   # OpenGL 3D viewer
+           echo /tmp/widget.py   > $inline   # exec PySide6 source
+           echo /tmp/report.html > $inline   # rich-text HTML
+    
+       The file is read by this filesystem and its type is inferred from
+       extension and magic bytes, then dispatched to the appropriate
+       inline widget.
+    
+    2. **Raw content** (binary or multi-line):
+    
+           cat /tmp/result.png > $inline   # PNG/JPEG/GIF/WEBP/PDF sniffed
+           cat /tmp/report.html > $inline  # HTML/SVG sniffed
+           cat /tmp/widget.py   > $inline  # Python source detected
+    
+       The bytes are sniffed for magic numbers (PNG/JPEG/GIF/WEBP/PDF/
+       SVG/HTML), Python source heuristics, and rendered directly.
+    
+    3. **JSON envelope** (advanced control):
+    
+           echo '{"type":"info","text":"build done","level":"ok"}' > $inline
+           echo '{"type":"link","url":"...","label":"..."}' > $inline
+           echo '{"type":"python","code":"_widget = QPushButton(\\"Hi\\")"}' > $inline
+    
+       Detected by a leading `{`. Same schema as before, plus the new
+       `gif`, `audio`, `video`, `pdf`, `model3d`, and `python` types.
+    
+    `$inline` is a convenience shell variable that points at this file —
+    seeded by the terminal so the agent never has to spell out the
+    full /n/rioa/terms/<term_id>/inline path.
+    
+    Concurrency:
+        Each fid (open file handle) buffers independently, so multiple
+        producers can write inline payloads at the same time. This file
+        does NOT participate in fence parsing on $term/output, so writes
+        here stay safe even while agents are mid-stream.
+    """
+    
+    # Magic byte signatures for binary-content sniffing.
+    _MAGIC_PNG  = b'\x89PNG\r\n\x1a\n'
+    _MAGIC_JPEG = b'\xff\xd8\xff'
+    _MAGIC_GIF  = (b'GIF87a', b'GIF89a')
+    _MAGIC_WEBP = b'WEBP'  # at offset 8 inside RIFF
+    
+    # Cap on how big a payload we'll buffer in memory. 32 MB is plenty
+    # for any reasonable inline media; rejects accidental cat-of-huge-file.
+    _MAX_BYTES = 32 * 1024 * 1024
+    
+    def __init__(self, terminal_ref):
+        super().__init__("inline")
+        self._terminal_ref = terminal_ref
+        self._fid_buffers: Dict[int, bytearray] = {}
+        self._fid_truncated: Dict[int, bool] = {}
+    
+    async def read(self, fid: FidState, offset: int, count: int) -> bytes:
+        return (
+            b"Write to spawn an inline widget in the terminal:\n"
+            b"  echo /path/to/file > $inline    (path: image/gif/audio/video/pdf/3d/.py/.html)\n"
+            b"  echo www.google.com > $inline   (URL: opens an inline browser via QWebEngineView)\n"
+            b"  cat  /path/to/file > $inline    (raw bytes, magic-sniffed)\n"
+            b'  echo \'{"type":"...","..."}\' > $inline   (JSON envelope)\n'
+            b"types: image gif audio video pdf model3d python url html link info warn error\n"
+        )
+    
+    async def write(self, fid: FidState, offset: int, data: bytes) -> int:
+        buf = self._fid_buffers.get(fid.fid)
+        if buf is None:
+            buf = bytearray()
+            self._fid_buffers[fid.fid] = buf
+            self._fid_truncated[fid.fid] = False
+        # Cap memory usage.
+        room = self._MAX_BYTES - len(buf)
+        if room <= 0:
+            self._fid_truncated[fid.fid] = True
+            return len(data)  # ack, but drop
+        if len(data) > room:
+            buf.extend(data[:room])
+            self._fid_truncated[fid.fid] = True
+        else:
+            buf.extend(data)
+        return len(data)
+    
+    def clunk(self, fid: FidState):
+        """Dispatch the accumulated payload when the file handle closes."""
+        buf = self._fid_buffers.pop(fid.fid, None)
+        truncated = self._fid_truncated.pop(fid.fid, False)
+        if buf is None or not buf:
+            return
+        terminal = self._terminal_ref()
+        if terminal is None:
+            return
+        
+        # Capture the terminal's bash cwd so relative paths
+        # (e.g. `echo README.md > $inline` from /home/user/proj)
+        # resolve the way the user expects.
+        cwd = None
+        if hasattr(terminal, '_shell_cwd'):
+            try:
+                cwd = terminal._shell_cwd()
+            except Exception:
+                cwd = None
+        
+        # Auto-detect what we got: JSON envelope, file path, or raw bytes.
+        payload = self._dispatch(bytes(buf), truncated=truncated, cwd=cwd)
+        if payload is None:
+            return
+        
+        # Bounce to Qt main thread.
+        try:
+            import json as _json
+            from PySide6.QtCore import QMetaObject, Qt as _Qt, Q_ARG
+            QMetaObject.invokeMethod(
+                terminal, "_on_inline_media",
+                _Qt.QueuedConnection,
+                Q_ARG(str, _json.dumps(payload)),
+            )
+        except Exception:
+            pass
+    
+    # ------------------------------------------------------------------
+    # Auto-detection logic
+    # ------------------------------------------------------------------
+    
+    def _dispatch(self, data: bytes, truncated: bool = False,
+                  cwd: Optional[str] = None) -> Optional[Dict[str, Any]]:
+        """Examine the buffer and return a payload dict for the widget.
+        
+        Returns None if we can't make sense of the input.
+        Resolution order:
+          1. Looks like JSON (first non-whitespace byte is '{') → parse it.
+          2. Single short text line that resolves to an existing file path
+             → read & sniff. Both absolute paths and paths relative to the
+             terminal's shell cwd are accepted.
+          3. Looks like Python source (PySide6 inline scene) → python payload.
+          4. Binary or multi-line content → sniff magic bytes.
+          5. Plain text fallback → info widget.
+        """
+        # --- 1. JSON envelope ------------------------------------------
+        # We test on the raw bytes to avoid wasting a UTF-8 decode on
+        # potentially-binary data.
+        stripped = data.lstrip()
+        if stripped[:1] == b'{':
+            try:
+                import json as _json
+                obj = _json.loads(stripped.decode('utf-8'))
+                if isinstance(obj, dict) and obj.get('type'):
+                    return obj
+            except Exception:
+                # Falls through to other detectors — maybe it just
+                # happens to start with '{' but is actually content.
+                pass
+        
+        # --- 2. URL (single short text line that looks like a URL) ----
+        # Recognized forms:
+        #   https://example.com/foo
+        #   http://example.com
+        #   www.example.com
+        #   example.com / sub.example.org/path
+        # We test before path resolution because (a) URLs are
+        # unambiguous when they have a scheme, and (b) bare-domain
+        # heuristics shouldn't be defeated by an unrelated file with
+        # the same name happening to exist on disk.
+        if len(data) <= 4096 and b'\x00' not in data:
+            try:
+                text_for_url = data.decode('utf-8').strip()
+            except UnicodeDecodeError:
+                text_for_url = None
+            if text_for_url and '\n' not in text_for_url and self._looks_like_url(text_for_url):
+                return {"type": "url", "url": text_for_url}
+        
+        # --- 3. Path (single short text line, exists on disk) ----------
+        # Heuristic: <= 4096 bytes, no NULs, decodable as UTF-8, exactly
+        # one logical line. We accept absolute paths AND paths relative
+        # to the terminal's bash cwd, so `echo README.md > $inline` from
+        # /home/user/proj resolves to /home/user/proj/README.md.
+        #
+        # We refuse to treat tokens that look obviously like Python
+        # source as paths even if a file by that exact name happens to
+        # exist (e.g. the buffer literally is `import os` and there's
+        # an `import os` file somewhere). Path-likeness here means
+        # the line has no spaces, contains a slash or a recognizable
+        # extension, and isn't a Python keyword sequence.
+        if len(data) <= 4096 and b'\x00' not in data:
+            try:
+                text = data.decode('utf-8').strip()
+            except UnicodeDecodeError:
+                text = None
+            if text and '\n' not in text and self._looks_like_path(text):
+                # Try the path the user gave us, then a cwd-relative one.
+                resolved = self._resolve_path(text, cwd)
+                if resolved is not None:
+                    return self._dispatch_from_path(resolved)
+                # Path-shaped but not found — surface as error so the
+                # user sees the typo instead of a confusing info banner.
+                # We attach the cwd we tried so the message is debuggable.
+                if cwd and not text.startswith('/'):
+                    return {
+                        "type": "error",
+                        "text": f"inline: file not found: {text}  (cwd: {cwd})",
+                    }
+                return {
+                    "type": "error",
+                    "text": f"inline: file not found: {text}",
+                }
+        
+        # --- 3. Python source ------------------------------------------
+        # Heuristic: looks like Python and isn't already a recognized
+        # binary format. We accept either an explicit `#!python` shebang
+        # or any code that opens with familiar Python markers near the
+        # top. The magic-bytes sniff in step 4 takes precedence for
+        # binary formats, so we test it first to avoid false positives
+        # on e.g. an HTML file that happens to contain `import` somewhere.
+        if self._looks_like_python(data):
+            try:
+                code = data.decode('utf-8', errors='replace')
+                # Strip optional `#!python` shebang.
+                first_line, _, rest = code.partition('\n')
+                if first_line.strip().lower() in ('#!python', '#!pyside', '#!pyside6'):
+                    code = rest
+                return {"type": "python", "code": code}
+            except Exception:
+                pass
+        
+        # --- 4. Raw bytes — sniff magic ---------------------------------
+        kind = self._sniff_magic(data)
+        if kind == 'png':
+            return self._image_payload(data, 'png', truncated)
+        if kind == 'jpeg':
+            return self._image_payload(data, 'jpg', truncated)
+        if kind == 'gif':
+            # GIFs route to the animated widget, not the static image
+            # widget — animated GIFs should auto-loop.
+            return self._gif_payload(data, truncated)
+        if kind == 'webp':
+            return self._image_payload(data, 'webp', truncated)
+        if kind == 'pdf':
+            # PDF needs a path (PyMuPDF reads from disk). Materialize
+            # the bytes to a temp file.
+            return self._pdf_payload_from_bytes(data, truncated)
+        if kind == 'svg':
+            try:
+                text = data.decode('utf-8')
+                if len(text) <= 64 * 1024:
+                    return {"type": "html", "content": text}
+            except Exception:
+                pass
+            return {"type": "info", "text": "(SVG content received)"}
+        if kind == 'html':
+            try:
+                text = data.decode('utf-8', errors='replace')
+                if len(text) > 256 * 1024:
+                    text = text[:256 * 1024] + '\n<!-- ... truncated ... -->'
+                return {"type": "html", "content": text}
+            except Exception:
+                pass
+        
+        # --- 5. Plain text fallback ------------------------------------
+        try:
+            text = data.decode('utf-8', errors='replace').rstrip('\n')
+        except Exception:
+            return None
+        if not text:
+            return None
+        if len(text) <= 200 and '\n' not in text:
+            return {"type": "info", "text": text}
+        escaped = (text
+            .replace('&', '&amp;')
+            .replace('<', '&lt;')
+            .replace('>', '&gt;'))
+        if len(escaped) > 256 * 1024:
+            escaped = escaped[:256 * 1024] + '\n... truncated ...'
+        return {"type": "html", "content": f"<pre>{escaped}</pre>"}
+    
+    def _dispatch_from_path(self, path: str) -> Dict[str, Any]:
+        """Build a widget payload from an on-disk file path.
+        
+        Routes by extension. The widget loads from `path` directly when
+        possible (images, gifs, audio, video, pdf, 3d) so we don't have
+        to round-trip through base64 for files that already exist.
+        """
+        ext = os.path.splitext(path)[1].lower()
+        
+        # GIFs first — they need the animated widget, NOT the static one.
+        if ext == '.gif':
+            return {"type": "gif", "path": path}
+        # Other still images.
+        if ext in ('.png', '.jpg', '.jpeg', '.webp', '.bmp', '.svg'):
+            return {"type": "image", "path": path}
+        # Audio.
+        if ext in ('.mp3', '.wav', '.flac', '.ogg', '.m4a', '.aac', '.opus', '.wma'):
+            return {"type": "audio", "path": path}
+        # Video.
+        if ext in ('.mp4', '.mov', '.mkv', '.webm', '.avi', '.m4v', '.flv', '.wmv'):
+            return {"type": "video", "path": path}
+        # PDF.
+        if ext == '.pdf':
+            return {"type": "pdf", "path": path}
+        # 3D models.
+        if ext in ('.obj', '.stl', '.ply', '.glb', '.gltf', '.3ds', '.dae', '.fbx'):
+            return {"type": "model3d", "path": path}
+        # Python source — exec inline.
+        if ext == '.py':
+            try:
+                with open(path, 'r', encoding='utf-8', errors='replace') as f:
+                    code = f.read(1024 * 1024)  # 1 MB cap on script size
+                return {"type": "python", "code": code}
+            except Exception as e:
+                return {"type": "error", "text": f"inline: read failed: {e}"}
+        # HTML — read and embed.
+        if ext in ('.html', '.htm'):
+            try:
+                with open(path, 'r', encoding='utf-8', errors='replace') as f:
+                    content = f.read(256 * 1024)
+                return {"type": "html", "content": content}
+            except Exception as e:
+                return {"type": "error", "text": f"inline: read failed: {e}"}
+        # Plain text-ish.
+        if ext in ('.txt', '.log', '.md'):
+            try:
+                with open(path, 'r', encoding='utf-8', errors='replace') as f:
+                    content = f.read(256 * 1024)
+                escaped = (content
+                    .replace('&', '&amp;')
+                    .replace('<', '&lt;')
+                    .replace('>', '&gt;'))
+                return {"type": "html", "content": f"<pre>{escaped}</pre>"}
+            except Exception as e:
+                return {"type": "error", "text": f"inline: read failed: {e}"}
+        # Anything else: info banner with the path.
+        return {"type": "info", "text": f"file: {path}"}
+    
+    @staticmethod
+    def _looks_like_path(text: str) -> bool:
+        """Cheap heuristic: does this string look like a file path?
+        
+        Path-shaped means:
+          - no spaces (paths with spaces would need to be quoted by the
+            shell anyway, and `echo` would normalize them)
+          - no obvious Python/shell syntax (parens, brackets, '=', etc.)
+          - either contains a slash, or has a known media-file extension,
+            or both
+        
+        We deliberately reject things like `import os` or `_widget = QPushButton()`
+        even if a file by that exact name happens to exist somewhere — those
+        are Python source and we want them to fall through to the Python
+        detector.
+        """
+        if not text or len(text) > 4096:
+            return False
+        # Must be a single token on a single line.
+        if any(c in text for c in ' \t\n\r'):
+            return False
+        # Reject obvious non-paths.
+        if any(c in text for c in '()[]{}=;<>|&'):
+            return False
+        # Accept: contains a slash (any kind of path).
+        if '/' in text:
+            return True
+        # Accept: bare filename with a recognized extension. We restrict
+        # to the set of extensions our dispatch actually handles, so
+        # arbitrary tokens like `import` (no dot) or `__init__.py` don't
+        # both register — only real media/code files.
+        _PATH_EXTS = {
+            # images
+            '.png', '.jpg', '.jpeg', '.gif', '.webp', '.bmp', '.svg',
+            # audio
+            '.mp3', '.wav', '.flac', '.ogg', '.m4a', '.aac', '.opus', '.wma',
+            # video
+            '.mp4', '.mov', '.mkv', '.webm', '.avi', '.m4v', '.flv', '.wmv',
+            # documents
+            '.pdf', '.html', '.htm', '.txt', '.log', '.md',
+            # 3D
+            '.obj', '.stl', '.ply', '.glb', '.gltf', '.3ds', '.dae', '.fbx',
+            # code
+            '.py',
+        }
+        ext = os.path.splitext(text)[1].lower()
+        return ext in _PATH_EXTS
+    
+    # Common TLDs we accept for bare-domain detection. Not exhaustive
+    # — agents can always be explicit and use https:// for anything
+    # else. Keep this list narrow enough that random English words
+    # like `back.up` don't get mistaken for URLs.
+    _COMMON_TLDS = frozenset({
+        'com', 'org', 'net', 'edu', 'gov', 'mil', 'int',
+        'io', 'co', 'ai', 'app', 'dev', 'me', 'tv', 'tech',
+        'info', 'biz', 'name', 'mobi', 'pro', 'xyz', 'site',
+        'online', 'shop', 'cloud', 'page', 'blog', 'news',
+        # ccTLDs we expect agents to encounter most often
+        'us', 'uk', 'ca', 'au', 'de', 'fr', 'jp', 'cn', 'kr',
+        'in', 'br', 'mx', 'es', 'it', 'nl', 'se', 'no', 'fi',
+        'dk', 'pl', 'ru', 'ch', 'be', 'at', 'eu',
+    })
+    
+    @classmethod
+    def _looks_like_url(cls, text: str) -> bool:
+        """Cheap heuristic: does this string look like a URL?
+        
+        Accepts:
+          - Anything with an explicit scheme: http://, https://, ftp://,
+            file://. The `://` is unambiguous.
+          - Bare domains starting with `www.` (case-insensitive).
+          - `<host>.<tld>(/...)?` where <tld> is a recognized TLD. This
+            keeps us from false-positiving on filenames like `notes.txt`
+            (txt isn't a TLD).
+        
+        Rejects:
+          - Anything with whitespace (URLs don't have spaces).
+          - File paths starting with `/` or `~` (they're not URLs).
+          - Single-segment tokens with no dots.
+        """
+        if not text:
+            return False
+        # No whitespace anywhere.
+        if any(c in text for c in ' \t\n\r'):
+            return False
+        # Filesystem-anchored paths are never URLs.
+        if text.startswith('/') or text.startswith('~'):
+            return False
+        # Reject obvious non-URL syntax.
+        if any(c in text for c in '()[]{}<>|&;'):
+            return False
+        lowered = text.lower()
+        # Explicit scheme.
+        for scheme in ('http://', 'https://', 'ftp://', 'file://'):
+            if lowered.startswith(scheme):
+                return True
+        # `www.` prefix is a strong signal.
+        if lowered.startswith('www.'):
+            return True
+        # Bare domain: must have at least one dot, and the segment after
+        # the final dot (before any path/query) must be a known TLD.
+        # We split on '/' first to peel off any path component.
+        host_part = lowered.split('/', 1)[0].split('?', 1)[0].split('#', 1)[0]
+        if '.' not in host_part:
+            return False
+        # No leading or trailing dot.
+        if host_part.startswith('.') or host_part.endswith('.'):
+            return False
+        last_segment = host_part.rsplit('.', 1)[-1]
+        # Bare ccTLDs / gTLDs we recognize.
+        if last_segment in cls._COMMON_TLDS:
+            return True
+        return False
+    
+    @staticmethod
+    def _resolve_path(text: str, cwd: Optional[str]) -> Optional[str]:
+        """Resolve a (possibly relative) path against the terminal's
+        bash cwd. Returns the absolute path if it exists and is a
+        regular file, else None.
+        
+        Tries in order:
+          1. The path as given (handles already-absolute paths).
+          2. Joined with the terminal's bash cwd (relative paths).
+          3. Expanded ~ (handles `echo ~/foo.png > $inline`).
+        """
+        # Try as-is first — covers absolute paths.
+        if os.path.isabs(text):
+            if os.path.isfile(text):
+                return text
+            return None
+        # Tilde expansion.
+        if text.startswith('~'):
+            expanded = os.path.expanduser(text)
+            if os.path.isfile(expanded):
+                return expanded
+        # Relative to bash cwd.
+        if cwd:
+            candidate = os.path.normpath(os.path.join(cwd, text))
+            if os.path.isfile(candidate):
+                return candidate
+        return None
+    
+    @classmethod
+    def _sniff_magic(cls, data: bytes) -> Optional[str]:
+        """Return a short type name based on magic bytes, or None."""
+        if data.startswith(cls._MAGIC_PNG):
+            return 'png'
+        if data.startswith(cls._MAGIC_JPEG):
+            return 'jpeg'
+        if any(data.startswith(m) for m in cls._MAGIC_GIF):
+            return 'gif'
+        # WEBP: RIFF....WEBP
+        if data[:4] == b'RIFF' and len(data) >= 12 and data[8:12] == b'WEBP':
+            return 'webp'
+        # PDF: starts with %PDF-
+        if data.startswith(b'%PDF-'):
+            return 'pdf'
+        # SVG: starts with <?xml or <svg
+        head = data[:512].lstrip()
+        lower = head.lower()
+        if lower.startswith(b'<?xml') and b'<svg' in lower[:512]:
+            return 'svg'
+        if lower.startswith(b'<svg'):
+            return 'svg'
+        # HTML: <!doctype html, <html, or starts with <p>/<div>/etc.
+        if lower.startswith(b'<!doctype html') or lower.startswith(b'<html'):
+            return 'html'
+        # Crude check: starts with '<' and has a closing '>' nearby and
+        # contains nothing obviously binary in the first 512 bytes.
+        if (lower.startswith(b'<') and b'>' in lower[:64]
+                and b'\x00' not in head):
+            return 'html'
+        return None
+    
+    @classmethod
+    def _looks_like_python(cls, data: bytes) -> bool:
+        """Heuristic: does this look like Python source?
+        
+        We require either an explicit shebang or that the first ~512
+        bytes contain familiar Python markers AND are pure UTF-8 text
+        with no NUL bytes (rules out binary formats).
+        """
+        if b'\x00' in data[:512]:
+            return False
+        try:
+            head = data[:512].decode('utf-8')
+        except UnicodeDecodeError:
+            return False
+        head_stripped = head.lstrip()
+        # Explicit opt-in.
+        first_line = head_stripped.split('\n', 1)[0].strip().lower()
+        if first_line in ('#!python', '#!pyside', '#!pyside6'):
+            return True
+        # Heuristic markers: any of these strongly indicate Python.
+        markers = (
+            'from PySide6',
+            'from PyQt5',
+            'from PyQt6',
+            'import PySide6',
+            'import PyQt',
+            '_widget = ',
+            '_widget=',
+        )
+        if any(m in head for m in markers):
+            return True
+        # Weaker: the buffer starts with `import ` or `from ` AND the
+        # full data parses as Python. We only run compile() if cheap
+        # markers were seen.
+        if head_stripped.startswith(('import ', 'from ', 'def ', 'class ')):
+            try:
+                # Cap at 64 KB for the syntax check — anything larger is
+                # an unusual case and we'll let the full exec catch it.
+                sample = data[:64 * 1024].decode('utf-8', errors='replace')
+                compile(sample, '<inline-python-probe>', 'exec')
+                return True
+            except SyntaxError:
+                return False
+            except Exception:
+                return False
+        return False
+    
+    def _image_payload(self, data: bytes, fmt: str, truncated: bool) -> Dict[str, Any]:
+        """Wrap raw image bytes as a base64 image payload."""
+        import base64
+        if truncated:
+            # Image was cut off mid-stream — don't try to render bad bytes.
+            return {
+                "type": "error",
+                "text": f"inline: image exceeded {self._MAX_BYTES // (1024*1024)}MB cap",
+            }
+        return {
+            "type": "image",
+            "data": base64.b64encode(data).decode('ascii'),
+            "format": fmt,
+        }
+    
+    def _gif_payload(self, data: bytes, truncated: bool) -> Dict[str, Any]:
+        """Materialize raw GIF bytes to disk so QMovie can stream-decode it.
+        
+        QMovie wants a file path or QIODevice to animate; passing raw
+        bytes via QPixmap.loadFromData would render only the first frame.
+        We write to a tempfile and rely on the inline widget's keepalive
+        list to clean up.
+        """
+        if truncated:
+            return {
+                "type": "error",
+                "text": f"inline: gif exceeded {self._MAX_BYTES // (1024*1024)}MB cap",
+            }
+        import base64
+        return {
+            "type": "gif",
+            "data": base64.b64encode(data).decode('ascii'),
+        }
+    
+    def _pdf_payload_from_bytes(self, data: bytes, truncated: bool) -> Dict[str, Any]:
+        """Write PDF bytes to a temp file and return a path payload.
+        
+        PyMuPDF wants an on-disk path (or a stream open kwarg); the
+        path approach is simpler and matches how files arriving via
+        `echo /path > $inline` are already routed.
+        """
+        if truncated:
+            return {
+                "type": "error",
+                "text": f"inline: pdf exceeded {self._MAX_BYTES // (1024*1024)}MB cap",
+            }
+        import tempfile
+        try:
+            fd, tmp_path = tempfile.mkstemp(suffix='.pdf', prefix='inline_')
+            with os.fdopen(fd, 'wb') as f:
+                f.write(data)
+            return {"type": "pdf", "path": tmp_path}
+        except Exception as e:
+            return {"type": "error", "text": f"inline: pdf write failed: {e}"}
+
+
+class TerminalParseFile(SyntheticFile):
+    """
+    /n/rioa/terms/<term_id>/parse
+
+    Per-terminal parse file. Writing Python code here executes it in the
+    terminal's TerminalScenePanel — so ``graphics_scene``, ``graphics_view``
+    and ``main_window`` inside the code refer to the panel's QGraphicsScene,
+    QGraphicsView and the panel widget itself.
+
+    The panel is created lazily on first write, and made visible in the
+    terminal splitter so the user immediately sees the result.
+
+    Mirrors the structural contract of the global ParseFile: streaming
+    writes are buffered per-fid and dispatched on clunk.
+    """
+
+    def __init__(self, terminal_ref):
+        super().__init__("parse")
+        self._terminal_ref = terminal_ref
+        self._fid_parsers: Dict[int, StreamingParser] = {}
+        self._fid_decoders: Dict[int, Any] = {}
+
+    # ------------------------------------------------------------------
+    # Helpers
+    # ------------------------------------------------------------------
+
+    def _get_panel(self):
+        """
+        Resolve the terminal and (lazily) its TerminalScenePanel.
+        Returns None if the terminal has been garbage-collected.
+
+        We schedule both panel creation and visibility on the Qt main
+        thread because TerminalScenePanel constructs QGraphicsScene /
+        QGraphicsView and reparents the panel into the terminal splitter.
+        """
+        terminal = self._terminal_ref() if callable(self._terminal_ref) else self._terminal_ref
+        if terminal is None:
+            return None
+
+        # Fast path: panel already exists.
+        if getattr(terminal, "scene_panel", None) is not None:
+            return terminal.scene_panel
+
+        # Slow path: build it on the Qt main thread, then wait for it.
+        from PySide6.QtCore import QMetaObject, Qt as _Qt
+        try:
+            QMetaObject.invokeMethod(
+                terminal, "ensure_scene_panel_visible",
+                _Qt.BlockingQueuedConnection,
+            )
+        except Exception:
+            # BlockingQueuedConnection cannot be used on the same thread as
+            # the receiver; fall back to a direct call (we're on Qt main).
+            terminal.ensure_scene_panel_visible()
+
+        return getattr(terminal, "scene_panel", None)
+
+    # ------------------------------------------------------------------
+    # 9P file protocol
+    # ------------------------------------------------------------------
+
+    async def read(self, fid: FidState, offset: int, count: int) -> bytes:
+        parser = self._fid_parsers.get(fid.fid)
+        if parser and parser.has_content():
+            return b"buffering...\n"
+        return b"ready\n"
+
+    async def write(self, fid: FidState, offset: int, data: bytes) -> int:
+        try:
+            if fid.fid not in self._fid_parsers:
+                self._fid_parsers[fid.fid] = StreamingParser()
+            if fid.fid not in self._fid_decoders:
+                import codecs
+                self._fid_decoders[fid.fid] = codecs.getincrementaldecoder('utf-8')('strict')
+
+            parser = self._fid_parsers[fid.fid]
+            decoder = self._fid_decoders[fid.fid]
+            text = decoder.decode(data, False)
+            if text:
+                parser.feed(text)
+            return len(data)
+        except UnicodeDecodeError:
+            raise ValueError("Invalid UTF-8")
+
+    def clunk(self, fid: FidState):
+        """Execute accumulated code when the file is closed."""
+        decoder = self._fid_decoders.pop(fid.fid, None)
+        if decoder:
+            try:
+                tail = decoder.decode(b'', True)
+                if tail:
+                    parser = self._fid_parsers.get(fid.fid)
+                    if parser:
+                        parser.feed(tail)
+            except UnicodeDecodeError:
+                pass
+
+        parser = self._fid_parsers.get(fid.fid)
+        if not parser:
+            return
+        code = parser.flush()
+        del self._fid_parsers[fid.fid]
+
+        if code:
+            asyncio.create_task(self._execute_code(code))
+
+    async def _execute_code(self, code: str):
+        """Execute code inside the terminal's TerminalScenePanel."""
+        panel = self._get_panel()
+        if panel is None:
+            print(f"TerminalParseFile: terminal no longer exists, skipping execute")
+            return
+
+        executor = panel.executor
+
+        # Capture stdout/stderr so prints inside user code surface in the
+        # server log (the terminal itself doesn't currently expose a
+        # dedicated output sink for /parse, mirroring Acme/operator panels).
+        stdout_capture = io.StringIO()
+        stderr_capture = io.StringIO()
+        with redirect_stdout(stdout_capture), redirect_stderr(stderr_capture):
+            try:
+                result = await executor.execute(code)
+            except Exception as e:
+                print(f"TerminalParseFile [{panel.term_id}] execution error: {e}")
+                return
+
+        out = stdout_capture.getvalue()
+        err = stderr_capture.getvalue()
+        if out:
+            print(f"[term {panel.term_id} /parse stdout]\n{out}", end="")
+        if err:
+            print(f"[term {panel.term_id} /parse stderr]\n{err}", end="")
+
+        if result.success:
+            print(
+                f"✓ term {panel.term_id} /parse: "
+                f"{len(result.items_registered)} item(s), "
+                f"{len(result.widgets_created)} widget(s), "
+                f"version {panel.scene_manager.versions.current_version}"
+            )
+        else:
+            print(f"✗ term {panel.term_id} /parse failed:\n{result.error}")
 
 
 class RoutesManager:
@@ -1205,7 +2038,14 @@ class RoutesFile(SyntheticFile):
     
     /n/rioa/routes
     
-    Read:  returns all active attachments, one per line:
+    Read:  returns all active attachments, one per line. SECOND open
+           (after the first read fully consumed the previous content)
+           BLOCKS until a route is added/removed/changed — this is the
+           push channel for clients like the operator UI. Shell users
+           who `cat routes` once still get an immediate return + EOF
+           because each cat does one open → read-to-EOF → close.
+    
+           Format per line:
            /path/to/source -> /path/to/destination [running|stopped]
     
     Write: /path/to/a -> /path/to/b
@@ -1218,20 +2058,54 @@ class RoutesFile(SyntheticFile):
     def __init__(self, routes_manager: RoutesManager):
         super().__init__("routes")
         self._manager = routes_manager
+        # Push notification: every route change `set()`s this event.
+        # Reads at offset 0 wait on it after the previous content was
+        # consumed. First read after construction returns immediately
+        # because the event starts set (initial state is "ready").
+        self._changed = asyncio.Event()
+        self._changed.set()
+        self._content_consumed = False
+        self._lock = asyncio.Lock()
+        # Hook into the manager so add/remove fires the event.
+        self._manager.add_listener(self._on_route_change)
+    
+    def _on_route_change(self, event: str, source: str, destination: str = ""):
+        """Called by RoutesManager._notify on every add/remove. Wakes
+        any blocked readers."""
+        self._changed.set()
+    
+    async def _render(self) -> bytes:
+        """Serialize current routes to bytes."""
+        routes = self._manager.list_routes()
+        if not routes:
+            return b"(no routes)\n"
+        lines = []
+        for source, destination, running in routes:
+            status = "running" if running else "stopped"
+            lines.append(f"{source} -> {destination} [{status}]")
+        return ("\n".join(lines) + "\n").encode()
     
     async def read(self, fid: FidState, offset: int, count: int) -> bytes:
-        routes = self._manager.list_routes()
+        # If a previous read fully consumed the content AND we're back
+        # at offset 0, we're starting a new read cycle. Block until
+        # something changes.
+        if offset == 0 and self._content_consumed:
+            async with self._lock:
+                if self._content_consumed:
+                    self._content_consumed = False
+                    self._changed.clear()
+        # Wait for content to be ready (initially set, then set again
+        # on every route change).
+        await self._changed.wait()
         
-        if not routes:
-            text = "(no routes)\n"
-        else:
-            lines = []
-            for source, destination, running in routes:
-                status = "running" if running else "stopped"
-                lines.append(f"{source} -> {destination} [{status}]")
-            text = "\n".join(lines) + "\n"
-        
-        return text.encode()[offset:offset + count]
+        async with self._lock:
+            data = await self._render()
+            chunk = data[offset:offset + count]
+            if offset + len(chunk) >= len(data):
+                # Reader hit EOF — mark consumed so the next offset-0
+                # read will rearm.
+                self._content_consumed = True
+            return chunk
     
     async def write(self, fid: FidState, offset: int, data: bytes) -> int:
         text = data.decode('utf-8').strip()
@@ -1268,6 +2142,8 @@ class TerminalDir(SyntheticDir):
     ├── ctl        # Write commands to execute in shell
     ├── input      # Write prompts to send to connected agent
     ├── output     # Write to display text, read to monitor (bidirectional)
+    ├── inline     # Write JSON envelopes to render inline media widgets
+    ├── parse      # Write Python code to draw on this terminal's scene panel
     ├── stdin      # Write commands to execute in shell (route target)
     ├── stdout     # Read shell output (blocking, enables while-cat loops)
     └── interrupt  # Write anything to send SIGINT to shell
@@ -1283,12 +2159,16 @@ class TerminalDir(SyntheticDir):
         self.output_file = TerminalOutputFile(terminal_ref)
         self.stdout_file = TerminalStdoutFile()
         self.stdin_file = TerminalStdinFile(terminal_ref, self.stdout_file)
+        self.parse_file = TerminalParseFile(terminal_ref)
+        self.inline_file = TerminalInlineFile(terminal_ref)
         
         self.add(CtlFile("ctl", TerminalCtlHandler(terminal_ref)))
         self.add(TerminalInputFile(terminal_ref))
         self.add(self.output_file)
         self.add(self.stdout_file)
         self.add(self.stdin_file)
+        self.add(self.parse_file)
+        self.add(self.inline_file)
         self.add(TerminalInterruptFile(terminal_ref))
 
 
@@ -1300,8 +2180,9 @@ class TerminalsDir(SyntheticDir):
     ├── term_a1b2c3d4/
     │   ├── ctl
     │   ├── input
-    │   ├── output
-    │   └── bash
+    │   ├── output       # text (fence parser → inline code widgets)
+    │   ├── inline       # JSON envelopes → inline media widgets
+    │   └── ...
     └── term_e5f6g7h8/
         └── ...
     """
@@ -1677,7 +2558,31 @@ class SceneDir(SyntheticDir):
         print("  SceneDir: creating ctl...")
         # Control (with undo/redo commands)
         self.add(CtlFile("ctl", SceneCtlHandler(scene_manager)))
-        
+
+        print("  SceneDir: creating quick file...")
+        self.quick_file = QuickFile(
+            scene_manager, self.executor,
+            stdout_file=self.stdout,
+            stderr_file=self.stderr,
+            parse_file=self.parse_file,
+        )
+        self.add(self.quick_file)
+
+        # Signals directory — UDP-backed cross-machine PySide6 Signals.
+        # The bus itself is started by RioServer (main.py) so this dir
+        # just exposes its state and ctl. bus_getter is a callable
+        # rather than the bus directly because the dir is built before
+        # the server actually starts the bus.
+        if _HAS_SIGNALS:
+            try:
+                print("  SceneDir: creating signals dir...")
+                self.signals_dir = SignalsDir(bus_getter=_rio_signals_bus)
+                self.add(self.signals_dir)
+            except Exception as e:
+                print(f"WARNING: Could not create SignalsDir: {e}")
+                import traceback
+                traceback.print_exc()
+
         print("  SceneDir: taking initial snapshot...")
         # Take initial snapshot (version 0 = empty scene)
         scene_manager.take_snapshot(label="initial", code="")
@@ -1699,9 +2604,13 @@ class RioRoot(SyntheticDir):
     │       ├── ctl       # Execute shell commands
     │       ├── input     # Send prompts to connected agent
     │       ├── output    # Monitor terminal output
+    │       ├── parse     # Python code → draws on this terminal's scene panel
     │       ├── stdin     # Write commands to shell (route target)
     │       ├── stdout    # Read shell output (blocking)
     │       └── interrupt # Send SIGINT
+    ├── nodes/            # User-created operator nodes
+    │   ├── ctl           # echo "new text foo" / "delete text_foo" > ctl
+    │   └── <kind>_<id>/  # text/debug/media/bash/python — see nodes.py
     └── scene/
         ├── ctl
         ├── parse
@@ -1709,7 +2618,8 @@ class RioRoot(SyntheticDir):
         ├── STDERR        # Blocking read (uppercase = blocking)
         ├── vars
         ├── state         # cp-friendly session save/restore
-        └── version       # cat = list + current; echo undo/redo > version
+        ├── version       # cat = list + current; echo undo/redo > version
+        └── quick
     """
     
     def __init__(self, scene_manager: SceneManager = None, qt_objects: dict = None):
@@ -1736,6 +2646,27 @@ class RioRoot(SyntheticDir):
         # Terminals directory (receives routes_manager for auto-wiring)
         self.terms_dir = TerminalsDir(self.routes_manager)
         self.add(self.terms_dir)
+
+        # User-created operator nodes (text/debug/media/bash/python).
+        # See nodes.py — the operator's UI writes "new <kind> <id>" to
+        # nodes/ctl and the matching <kind>_<id>/ directory appears.
+        # Routes manager is passed in so deleting a node also clears
+        # any /n/<m>/routes entries whose endpoints lived inside that
+        # node — otherwise Plan9Attachment keeps trying to cat the now-
+        # vanished port files.
+        try:
+            from .nodes import NodesDir
+        except ImportError:
+            # Standalone (no package) layout — nodes.py sits next to
+            # this file on the path.
+            from nodes import NodesDir
+        try:
+            self.nodes_dir = NodesDir(routes_manager=self.routes_manager)
+            self.add(self.nodes_dir)
+        except Exception as e:
+            print(f"WARNING: Could not create NodesDir: {e}")
+            import traceback
+            traceback.print_exc()
 
         try:
             from .acme.acme_fs import get_acme_dir
