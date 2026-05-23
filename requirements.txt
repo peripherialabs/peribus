@@ -1,3 +1,10 @@
+# Core
+python-dotenv
+numpy
+requests
+taskgroup
+cryptography
+
 # LLM Providers
 anthropic
 openai
@@ -6,25 +13,62 @@ groq
 cerebras-cloud-sdk
 cartesia
 
+# Embeddings / ML
+sentence-transformers
+transformers
+torch
+faiss-cpu
+vllm
+mediapipe==0.10.21
+qwen-vl-utils
+diffusers
 
-# Qt for Rio GUI
+# Qt / GUI
 PySide6
+PyOpenGL
+pyqtgraph
 
-# Tools
-requests
-dotenv
-pandas
+# Audio
+pyaudio
+SpeechRecognition
+mutagen
+
+# Vision / Screen Capture
+opencv-python==4.11.0.86
+pillow
+mss
+
+# 3D Rendering
+trimesh
+pyrender
+moderngl
+PyGLM
+
+# Documents
 python-docx
 openpyxl
 PyPDF2
-pyqtgraph
-mutagen
-mediapipe==0.10.21
-google-genai
-opencv-python==4.11.0.86
-pyaudio
-pillow
-mss
-taskgroup
-PyOpenGL
-trimesh
+pymupdf
+pdfminer.six
+
+# Data
+pandas
+
+# Networking
+websockets
+zeroconf
+pyfuse3
+
+# Scientific / Apps
+pyscf
+rdkit
+nibabel
+nilearn
+mne
+ase
+
+
+DracoPy
+mapbox-earcut
+qasync
+
