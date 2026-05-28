@@ -108,6 +108,7 @@ import os
 import re
 import subprocess
 import threading
+import traceback
 import numpy as np
 from collections import OrderedDict
 
@@ -117,7 +118,9 @@ from PySide6.QtWidgets import (
     QScrollArea, QListWidget, QLineEdit, QGraphicsItem,
     QGraphicsDropShadowEffect, QSizePolicy
 )
-from PySide6.QtCore import Qt, QTimer, Signal, QObject
+from PySide6.QtCore import (
+    Qt, QTimer, Signal, QObject, QRunnable, QThreadPool, Slot
+)
 from PySide6.QtGui import (
     QPainter, QColor, QFont, QPen, QBrush, QImage, QLinearGradient
 )
@@ -205,6 +208,88 @@ PRESETS = {
 }
 
 # ═══════════════════════════════════════════════════════════════
+#  ASYNC TASK INFRASTRUCTURE
+#  Heavy compute runs in a worker thread; the result is delivered
+#  to the main thread via signals (so GL/Qt calls stay on the GUI
+#  thread). The number of in-flight tasks is exposed so the viewer
+#  can render a spinner and the panel can disable buttons.
+# ═══════════════════════════════════════════════════════════════
+
+class _TaskSignals(QObject):
+    started = Signal(str)             # tag
+    finished = Signal(str, object)    # tag, payload (whatever the worker returned)
+    failed = Signal(str, str)         # tag, traceback
+    busy_changed = Signal(int)        # number of in-flight tasks
+
+class _TaskRunner(QRunnable):
+    """Run `fn(*args, **kwargs)` on the thread pool, emit signals on done/fail."""
+    def __init__(self, signals, tag, fn, *args, **kwargs):
+        super().__init__()
+        self.setAutoDelete(True)
+        self._signals = signals
+        self._tag = tag
+        self._fn = fn
+        self._args = args
+        self._kwargs = kwargs
+
+    @Slot()
+    def run(self):
+        try:
+            res = self._fn(*self._args, **self._kwargs)
+            self._signals.finished.emit(self._tag, res)
+        except Exception as ex:
+            tb = traceback.format_exc()
+            self._signals.failed.emit(self._tag, f"{type(ex).__name__}: {ex}\n{tb}")
+
+class _TaskManager(QObject):
+    """Singleton-style coordinator for background work.
+    Tracks busy count and broadcasts state changes."""
+    def __init__(self):
+        super().__init__()
+        self.signals = _TaskSignals()
+        self._pool = QThreadPool.globalInstance()
+        # Keep some breathing room for the GL thread; cap workers.
+        try:
+            n_cpu = max(2, min(4, (os.cpu_count() or 2)))
+            self._pool.setMaxThreadCount(n_cpu)
+        except Exception:
+            pass
+        self._busy = 0
+        self._lock = threading.Lock()
+        self.signals.finished.connect(self._on_done)
+        self.signals.failed.connect(self._on_done_err)
+
+    def submit(self, tag, fn, *args, **kwargs):
+        with self._lock:
+            self._busy += 1
+            n = self._busy
+        self.signals.busy_changed.emit(n)
+        self.signals.started.emit(tag)
+        runner = _TaskRunner(self.signals, tag, fn, *args, **kwargs)
+        self._pool.start(runner)
+
+    def _on_done(self, *_):
+        with self._lock:
+            self._busy = max(0, self._busy - 1)
+            n = self._busy
+        self.signals.busy_changed.emit(n)
+
+    def _on_done_err(self, *_):
+        self._on_done()
+
+    @property
+    def busy(self):
+        return self._busy
+
+# Module-level singleton (instantiated lazily after QApplication exists)
+_TASKS = None
+def tasks():
+    global _TASKS
+    if _TASKS is None:
+        _TASKS = _TaskManager()
+    return _TASKS
+
+# ═══════════════════════════════════════════════════════════════
 #  SHADERS
 # ═══════════════════════════════════════════════════════════════
 
@@ -275,45 +360,136 @@ void main() {
 }"""
 
 # ═══════════════════════════════════════════════════════════════
-#  GEOMETRY (numpy-accelerated)
+#  GEOMETRY (numpy-accelerated, template-cached)
 # ═══════════════════════════════════════════════════════════════
 
+# Cache of unit-sphere templates keyed by (segs_h, segs_v) → (pos, normal) arrays.
+# Per-atom mesh = template * radius + color broadcast. Avoids rebuilding
+# the same 1.5k-vertex sphere for every atom in every redraw.
+_SPHERE_TEMPLATES = {}
+_CYLINDER_TEMPLATES = {}
+
+def _sphere_template(segs_h, segs_v):
+    key = (segs_h, segs_v)
+    tpl = _SPHERE_TEMPLATES.get(key)
+    if tpl is not None:
+        return tpl
+    theta = np.linspace(0.0, np.pi, segs_v + 1, dtype=np.float32)
+    phi = np.linspace(0.0, 2 * np.pi, segs_h + 1, dtype=np.float32)
+    st = np.sin(theta); ct = np.cos(theta)
+    sp = np.sin(phi);   cp = np.cos(phi)
+    # Grid of unit-sphere vertices, shape (segs_v+1, segs_h+1, 3)
+    x = np.outer(st, cp)
+    y = np.outer(ct, np.ones_like(phi))
+    z = np.outer(st, sp)
+    grid = np.stack([x, y, z], axis=-1).astype(np.float32)
+    # Two triangles per quad: (j,i)(j+1,i)(j+1,i+1) and (j,i)(j+1,i+1)(j,i+1)
+    p00 = grid[:-1, :-1]
+    p10 = grid[1:,  :-1]
+    p11 = grid[1:,  1:]
+    p01 = grid[:-1, 1:]
+    tris = np.stack([p00, p10, p11, p00, p11, p01], axis=2)  # (V, H, 6, 3)
+    pos = tris.reshape(-1, 3)
+    # On a unit sphere, vertex == normal.
+    norm = pos.copy()
+    _SPHERE_TEMPLATES[key] = (pos, norm)
+    return pos, norm
+
 def _make_sphere(radius, segs_h, segs_v, color_hex):
+    """Returns flat list pos(3)+normal(3)+color(3) per vertex (legacy API).
+    Vectorized via cached unit template, ~100x faster than the original loop."""
+    pos_t, nrm_t = _sphere_template(segs_h, segs_v)
     r, g, b = _hex(color_hex)
-    theta = np.linspace(0, np.pi, segs_v+1)
-    phi = np.linspace(0, 2*np.pi, segs_h+1)
-    x = np.outer(np.sin(theta), np.cos(phi)) * radius
-    y = np.outer(np.cos(theta), np.ones(segs_h+1)) * radius
-    z = np.outer(np.sin(theta), np.sin(phi)) * radius
-    verts = np.empty((segs_v * segs_h * 6, 9), dtype=np.float32)
-    idx = 0
-    for j in range(segs_v):
-        for i in range(segs_h):
-            p00 = np.array([x[j,i],y[j,i],z[j,i]])
-            p10 = np.array([x[j+1,i],y[j+1,i],z[j+1,i]])
-            p11 = np.array([x[j+1,i+1],y[j+1,i+1],z[j+1,i+1]])
-            p01 = np.array([x[j,i+1],y[j,i+1],z[j,i+1]])
-            for p in (p00,p10,p11,p00,p11,p01):
-                n = p / (np.linalg.norm(p)+1e-9)
-                verts[idx] = [p[0],p[1],p[2],n[0],n[1],n[2],r,g,b]
-                idx += 1
-    return verts[:idx].flatten().tolist()
+    n = pos_t.shape[0]
+    out = np.empty((n, 9), dtype=np.float32)
+    out[:, 0:3] = pos_t * radius
+    out[:, 3:6] = nrm_t
+    out[:, 6] = r; out[:, 7] = g; out[:, 8] = b
+    return out.ravel().tolist()
+
+def _make_sphere_array(radius, segs_h, segs_v, color_hex):
+    """Same as _make_sphere but returns a numpy array instead of a list.
+    Used by the bulk batched molecule builder."""
+    pos_t, nrm_t = _sphere_template(segs_h, segs_v)
+    r, g, b = _hex(color_hex)
+    n = pos_t.shape[0]
+    out = np.empty((n, 9), dtype=np.float32)
+    out[:, 0:3] = pos_t * radius
+    out[:, 3:6] = nrm_t
+    out[:, 6] = r; out[:, 7] = g; out[:, 8] = b
+    return out
+
+def _cylinder_template(segs):
+    tpl = _CYLINDER_TEMPLATES.get(segs)
+    if tpl is not None:
+        return tpl
+    a = np.linspace(0.0, 2.0 * np.pi, segs + 1, dtype=np.float32)
+    cx = np.cos(a); sz = np.sin(a)
+    # Side strip — two triangles per face.
+    # Vertices on unit cylinder of half-height 0.5 (we scale by `h`).
+    x0, z0 = cx[:-1], sz[:-1]
+    x1, z1 = cx[1:],  sz[1:]
+    # 6 verts per face: (x0,-0.5,z0),(x1,-0.5,z1),(x1,0.5,z1),(x0,-0.5,z0),(x1,0.5,z1),(x0,0.5,z0)
+    n_face = segs
+    side_pos = np.empty((n_face, 6, 3), dtype=np.float32)
+    side_nrm = np.empty((n_face, 6, 3), dtype=np.float32)
+    side_pos[:, 0] = np.stack([x0, np.full_like(x0, -0.5), z0], axis=-1)
+    side_pos[:, 1] = np.stack([x1, np.full_like(x1, -0.5), z1], axis=-1)
+    side_pos[:, 2] = np.stack([x1, np.full_like(x1,  0.5), z1], axis=-1)
+    side_pos[:, 3] = side_pos[:, 0]
+    side_pos[:, 4] = side_pos[:, 2]
+    side_pos[:, 5] = np.stack([x0, np.full_like(x0,  0.5), z0], axis=-1)
+    # Side normal: outward radial of the lower-left corner (matches original).
+    radial = np.stack([x0, np.zeros_like(x0), z0], axis=-1)
+    side_nrm[:] = radial[:, None, :]
+    # Top cap (normal up): center, (x0,0.5,z0), (x1,0.5,z1)
+    cap_top_pos = np.empty((n_face, 3, 3), dtype=np.float32)
+    cap_top_pos[:, 0] = np.array([0.0, 0.5, 0.0], dtype=np.float32)
+    cap_top_pos[:, 1] = np.stack([x0, np.full_like(x0, 0.5), z0], axis=-1)
+    cap_top_pos[:, 2] = np.stack([x1, np.full_like(x1, 0.5), z1], axis=-1)
+    cap_top_nrm = np.broadcast_to(np.array([0, 1, 0], dtype=np.float32),
+                                  cap_top_pos.shape).copy()
+    # Bottom cap (normal down): center, (x1,-0.5,z1), (x0,-0.5,z0)
+    cap_bot_pos = np.empty((n_face, 3, 3), dtype=np.float32)
+    cap_bot_pos[:, 0] = np.array([0.0, -0.5, 0.0], dtype=np.float32)
+    cap_bot_pos[:, 1] = np.stack([x1, np.full_like(x1, -0.5), z1], axis=-1)
+    cap_bot_pos[:, 2] = np.stack([x0, np.full_like(x0, -0.5), z0], axis=-1)
+    cap_bot_nrm = np.broadcast_to(np.array([0, -1, 0], dtype=np.float32),
+                                  cap_bot_pos.shape).copy()
+    pos = np.concatenate([side_pos.reshape(-1, 3),
+                          cap_top_pos.reshape(-1, 3),
+                          cap_bot_pos.reshape(-1, 3)], axis=0)
+    nrm = np.concatenate([side_nrm.reshape(-1, 3),
+                          cap_top_nrm.reshape(-1, 3),
+                          cap_bot_nrm.reshape(-1, 3)], axis=0)
+    _CYLINDER_TEMPLATES[segs] = (pos, nrm)
+    return pos, nrm
 
 def _make_cylinder(radius, h, segs, color_hex):
+    """Returns flat list pos(3)+normal(3)+color(3) per vertex (legacy API)."""
+    pos_t, nrm_t = _cylinder_template(segs)
     cr, cg, cb = _hex(color_hex)
-    verts = []; hh = h/2
-    for i in range(segs):
-        a0 = 2*math.pi*i/segs; a1 = 2*math.pi*(i+1)/segs
-        x0,z0 = math.cos(a0)*radius, math.sin(a0)*radius
-        x1,z1 = math.cos(a1)*radius, math.sin(a1)*radius
-        nx0,nz0 = math.cos(a0), math.sin(a0)
-        for v in ((x0,-hh,z0),(x1,-hh,z1),(x1,hh,z1),(x0,-hh,z0),(x1,hh,z1),(x0,hh,z0)):
-            verts.extend(v); verts.extend((nx0,0,nz0)); verts.extend((cr,cg,cb))
-        for v in ((0,hh,0),(x0,hh,z0),(x1,hh,z1)):
-            verts.extend(v); verts.extend((0,1,0)); verts.extend((cr,cg,cb))
-        for v in ((0,-hh,0),(x1,-hh,z1),(x0,-hh,z0)):
-            verts.extend(v); verts.extend((0,-1,0)); verts.extend((cr,cg,cb))
-    return verts
+    n = pos_t.shape[0]
+    out = np.empty((n, 9), dtype=np.float32)
+    # Scale: radius on XZ, h on Y
+    out[:, 0] = pos_t[:, 0] * radius
+    out[:, 1] = pos_t[:, 1] * h
+    out[:, 2] = pos_t[:, 2] * radius
+    out[:, 3:6] = nrm_t
+    out[:, 6] = cr; out[:, 7] = cg; out[:, 8] = cb
+    return out.ravel().tolist()
+
+def _make_cylinder_array(radius, h, segs, color_hex):
+    pos_t, nrm_t = _cylinder_template(segs)
+    cr, cg, cb = _hex(color_hex)
+    n = pos_t.shape[0]
+    out = np.empty((n, 9), dtype=np.float32)
+    out[:, 0] = pos_t[:, 0] * radius
+    out[:, 1] = pos_t[:, 1] * h
+    out[:, 2] = pos_t[:, 2] * radius
+    out[:, 3:6] = nrm_t
+    out[:, 6] = cr; out[:, 7] = cg; out[:, 8] = cb
+    return out
 
 def _transform_verts(verts_list, mat):
     arr = np.array(verts_list, dtype=np.float32).reshape(-1, 9)
@@ -324,20 +500,41 @@ def _transform_verts(verts_list, mat):
     nrm_t = (m4[:3,:3] @ arr[:,3:6].T).T
     return np.hstack([pos_t, nrm_t, arr[:,6:9]]).flatten().tolist()
 
+def _transform_verts_array(arr, mat):
+    """Like _transform_verts but takes/returns numpy arrays of shape (N, 9)."""
+    if arr.shape[0] == 0:
+        return arr
+    m4 = np.array([[mat[c][r] for c in range(4)] for r in range(4)], dtype=np.float32)
+    ones = np.ones((arr.shape[0], 1), dtype=np.float32)
+    pos = np.hstack([arr[:, :3], ones])
+    pos_t = (m4 @ pos.T).T[:, :3]
+    nrm_t = (m4[:3, :3] @ arr[:, 3:6].T).T
+    out = np.empty_like(arr)
+    out[:, :3] = pos_t
+    out[:, 3:6] = nrm_t
+    out[:, 6:9] = arr[:, 6:9]
+    return out
+
 # ═══════════════════════════════════════════════════════════════
 #  PARSERS
 # ═══════════════════════════════════════════════════════════════
 
 def detect_bonds(atoms):
-    bonds = []
-    for i in range(len(atoms)):
-        for j in range(i+1, len(atoms)):
-            a, b = atoms[i], atoms[j]
-            d = math.sqrt((a['x']-b['x'])**2+(a['y']-b['y'])**2+(a['z']-b['z'])**2)
-            ci = ELEMENTS.get(a['el'],{'cov':0.77})['cov']
-            cj = ELEMENTS.get(b['el'],{'cov':0.77})['cov']
-            if 0.4 < d < (ci+cj)*1.3: bonds.append((i, j))
-    return bonds
+    """Detect bonds via vectorized distance + covalent-radius cutoff."""
+    n = len(atoms)
+    if n < 2:
+        return []
+    xyz = np.array([[a['x'], a['y'], a['z']] for a in atoms], dtype=np.float32)
+    cov = np.array([ELEMENTS.get(a['el'], {'cov': 0.77})['cov'] for a in atoms],
+                   dtype=np.float32)
+    # Pairwise distances (upper triangle only).
+    diff = xyz[:, None, :] - xyz[None, :, :]
+    d = np.sqrt(np.einsum('ijk,ijk->ij', diff, diff))
+    cutoff = (cov[:, None] + cov[None, :]) * 1.3
+    iu, ju = np.triu_indices(n, k=1)
+    mask = (d[iu, ju] > 0.4) & (d[iu, ju] < cutoff[iu, ju])
+    pairs = np.stack([iu[mask], ju[mask]], axis=1)
+    return [(int(i), int(j)) for i, j in pairs]
 
 def parse_xyz(text):
     """Parse XYZ format text → list of atom dicts."""
@@ -518,59 +715,139 @@ def _colormap_rwb(val, vmin, vmax):
 def cube_colormapped_isosurface(density_cube, property_cube, isovalue=0.05, vmin=None, vmax=None):
     """Generate isosurface mesh from density_cube, colored by property_cube values.
     Returns flat list of pos(3)+normal(3)+color(3) floats.
-    This is the VMD 'Volume' coloring method — e.g. ESP mapped onto electron density."""
-    g = density_cube['grid']; o = density_cube['origin']
-    ax = [np.array(a) for a in density_cube['axes']]; n = density_cube['npts']
-    pg = property_cube['grid']
-    # Determine color range
+    This is the VMD 'Volume' coloring method — e.g. ESP mapped onto electron density.
+    Vectorized: cells processed in bulk with numpy."""
+    g = np.asarray(density_cube['grid'], dtype=np.float32)
+    pg = np.asarray(property_cube['grid'], dtype=np.float32)
+    o = np.asarray(density_cube['origin'], dtype=np.float32)
+    ax = density_cube['axes']
+    n = density_cube['npts']
+    n1, n2, n3 = n
+    if g.size == 0 or n1 < 2 or n2 < 2 or n3 < 2:
+        return []
+    ax0 = np.asarray(ax[0], dtype=np.float32)
+    ax1 = np.asarray(ax[1], dtype=np.float32)
+    ax2 = np.asarray(ax[2], dtype=np.float32)
+    # Determine color range (symmetric around zero).
     if vmin is None: vmin = float(pg.min())
     if vmax is None: vmax = float(pg.max())
-    # Symmetric range for ESP
     vm = max(abs(vmin), abs(vmax))
     if vm > 0:
         vmin, vmax = -vm, vm
 
-    corner_offsets = [(0,0,0),(1,0,0),(1,1,0),(0,1,0),(0,0,1),(1,0,1),(1,1,1),(0,1,1)]
-    edges = [(0,1),(1,2),(2,3),(3,0),(4,5),(5,6),(6,7),(7,4),(0,4),(1,5),(2,6),(3,7)]
-    n1, n2, n3 = n
-    verts = []
-    for i in range(n1-1):
-        for j in range(n2-1):
-            for k in range(n3-1):
-                vals = [g[i+di,j+dj,k+dk] for di,dj,dk in corner_offsets]
-                signs = [1 if v >= isovalue else 0 for v in vals]
-                ci = sum(s<<idx for idx,s in enumerate(signs))
-                if ci == 0 or ci == 255: continue
-                positions = [o+(i+di)*ax[0]+(j+dj)*ax[1]+(k+dk)*ax[2] for di,dj,dk in corner_offsets]
-                pvals = [pg[i+di,j+dj,k+dk] for di,dj,dk in corner_offsets]
-                edge_pts = []; edge_colors = []
-                for c1,c2 in edges:
-                    if signs[c1] != signs[c2]:
-                        t = (isovalue-vals[c1])/(vals[c2]-vals[c1]+1e-12)
-                        t = max(0.0,min(1.0,t))
-                        pt = positions[c1]+t*(positions[c2]-positions[c1])
-                        pv = pvals[c1]+t*(pvals[c2]-pvals[c1])
-                        edge_pts.append(pt)
-                        edge_colors.append(_colormap_rwb(pv, vmin, vmax))
-                if len(edge_pts) < 3: continue
-                centroid = np.mean(edge_pts, axis=0)
-                v1 = edge_pts[1]-edge_pts[0]; v2 = edge_pts[2]-edge_pts[0]
-                normal = np.cross(v1,v2)
-                nl = np.linalg.norm(normal)
-                normal = normal/nl if nl > 1e-10 else np.array([0,0,1])
-                avg_col = (np.mean([c[0] for c in edge_colors]),
-                           np.mean([c[1] for c in edge_colors]),
-                           np.mean([c[2] for c in edge_colors]))
-                for ei in range(len(edge_pts)):
-                    for p_idx, p in enumerate([centroid, edge_pts[ei], edge_pts[(ei+1)%len(edge_pts)]]):
-                        verts.extend(p.tolist()); verts.extend(normal.tolist())
-                        if p_idx == 0:
-                            verts.extend(avg_col)
-                        elif p_idx == 1:
-                            verts.extend(edge_colors[ei])
-                        else:
-                            verts.extend(edge_colors[(ei+1)%len(edge_colors)])
-    return verts
+    # 8 corner values + property values per cell.
+    def _stack8(arr):
+        return np.stack([
+            arr[:-1, :-1, :-1], arr[1: , :-1, :-1], arr[1: , 1: , :-1], arr[:-1, 1: , :-1],
+            arr[:-1, :-1, 1: ], arr[1: , :-1, 1: ], arr[1: , 1: , 1: ], arr[:-1, 1: , 1: ],
+        ], axis=-1)
+    c_g = _stack8(g)
+    c_p = _stack8(pg)
+    signs = (c_g >= isovalue).astype(np.uint8)
+    code = np.zeros(signs.shape[:-1], dtype=np.int32)
+    for k in range(8):
+        code |= (signs[..., k].astype(np.int32) << k)
+    active = (code != 0) & (code != 255)
+    if not np.any(active):
+        return []
+    ii, jj, kk = np.where(active)
+    m_cells = ii.shape[0]
+    cell_g = c_g[ii, jj, kk]
+    cell_p = c_p[ii, jj, kk]
+    cell_s = signs[ii, jj, kk]
+    cell_origin = (o[None, :]
+                   + ii[:, None] * ax0[None, :]
+                   + jj[:, None] * ax1[None, :]
+                   + kk[:, None] * ax2[None, :])
+    corner_offsets = np.array([
+        [0,0,0],[1,0,0],[1,1,0],[0,1,0],[0,0,1],[1,0,1],[1,1,1],[0,1,1]
+    ], dtype=np.float32)
+    cw = (cell_origin[:, None, :]
+          + corner_offsets[None, :, 0:1] * ax0[None, None, :]
+          + corner_offsets[None, :, 1:2] * ax1[None, None, :]
+          + corner_offsets[None, :, 2:3] * ax2[None, None, :])
+    edge_pairs = np.array([
+        [0,1],[1,2],[2,3],[3,0],[4,5],[5,6],[6,7],[7,4],
+        [0,4],[1,5],[2,6],[3,7]
+    ], dtype=np.int32)
+    a_idx = edge_pairs[:, 0]; b_idx = edge_pairs[:, 1]
+    v_a = cell_g[:, a_idx]; v_b = cell_g[:, b_idx]
+    pv_a = cell_p[:, a_idx]; pv_b = cell_p[:, b_idx]
+    s_a = cell_s[:, a_idx]; s_b = cell_s[:, b_idx]
+    crossing = (s_a != s_b)
+    t = (isovalue - v_a) / (v_b - v_a + 1e-12)
+    t = np.clip(t, 0.0, 1.0)
+    p_a = cw[:, a_idx, :]
+    p_b = cw[:, b_idx, :]
+    edge_pts = p_a + t[:, :, None] * (p_b - p_a)        # (m_cells, 12, 3)
+    edge_pv = pv_a + t * (pv_b - pv_a)                  # (m_cells, 12)
+
+    # Red-white-blue colormap of edge property values, vectorized.
+    rng = (vmax - vmin) if (vmax != vmin) else 1.0
+    tt = np.clip((edge_pv - vmin) / rng, 0.0, 1.0)
+    low = tt < 0.5
+    s_low = tt * 2.0
+    s_high = (tt - 0.5) * 2.0
+    er = np.where(low, s_low, 1.0)
+    eg = np.where(low, s_low, 1.0 - s_high)
+    eb = np.where(low, 1.0, 1.0 - s_high)
+    edge_colors = np.stack([er, eg, eb], axis=-1)       # (m_cells, 12, 3)
+
+    crossing_f = crossing.astype(np.float32)
+    n_cross = crossing_f.sum(axis=1)
+    valid = n_cross >= 3
+    if not np.any(valid):
+        return []
+    # Centroid and average color over crossings.
+    edge_masked = edge_pts * crossing_f[:, :, None]
+    centroid = edge_masked.sum(axis=1) / np.maximum(n_cross[:, None], 1.0)
+    col_masked = edge_colors * crossing_f[:, :, None]
+    avg_color = col_masked.sum(axis=1) / np.maximum(n_cross[:, None], 1.0)
+    # First 3 crossings → cell normal.
+    order = np.argsort(-crossing_f, axis=1, kind='stable')
+    rows = np.arange(m_cells)
+    p0 = edge_pts[rows, order[:, 0]]
+    p1 = edge_pts[rows, order[:, 1]]
+    p2 = edge_pts[rows, order[:, 2]]
+    nrm = np.cross(p1 - p0, p2 - p0)
+    nlen = np.linalg.norm(nrm, axis=1, keepdims=True)
+    nrm = np.where(nlen > 1e-10, nrm / np.maximum(nlen, 1e-12),
+                   np.array([0.0, 0.0, 1.0], dtype=np.float32))
+
+    out_chunks = []
+    crossing_counts = np.unique(n_cross[valid].astype(np.int32))
+    for cnt in crossing_counts:
+        if cnt < 3:
+            continue
+        sel = np.where((n_cross.astype(np.int32) == cnt) & valid)[0]
+        if sel.size == 0:
+            continue
+        ord_sel = order[sel, :cnt]
+        rows_sel = np.repeat(sel[:, None], cnt, axis=1)
+        pts = edge_pts[rows_sel, ord_sel]                  # (m, cnt, 3)
+        cols = edge_colors[rows_sel, ord_sel]              # (m, cnt, 3)
+        cent = centroid[sel]
+        avg = avg_color[sel]
+        nrm_s = nrm[sel]
+        m = sel.size
+        next_pts = np.roll(pts, -1, axis=1)
+        next_cols = np.roll(cols, -1, axis=1)
+        # Per triangle: 3 vertices (centroid, pts[i], next_pts[i]).
+        tri_pos = np.empty((m, cnt, 3, 3), dtype=np.float32)
+        tri_pos[:, :, 0, :] = cent[:, None, :]
+        tri_pos[:, :, 1, :] = pts
+        tri_pos[:, :, 2, :] = next_pts
+        tri_nrm = np.broadcast_to(nrm_s[:, None, None, :], tri_pos.shape).copy()
+        tri_col = np.empty_like(tri_pos)
+        tri_col[:, :, 0, :] = avg[:, None, :]
+        tri_col[:, :, 1, :] = cols
+        tri_col[:, :, 2, :] = next_cols
+        block = np.concatenate([tri_pos, tri_nrm, tri_col], axis=-1)  # (m, cnt, 3, 9)
+        out_chunks.append(block.reshape(-1, 9))
+    if not out_chunks:
+        return []
+    flat = np.concatenate(out_chunks, axis=0).ravel()
+    return flat.tolist()
 
 def _make_volume_slice(cube_data, axis=1, pos=0.5):
     """Generate a slice image (numpy RGBA array) through a cube volume.
@@ -589,14 +866,22 @@ def _make_volume_slice(cube_data, axis=1, pos=0.5):
     else:
         sl = g[:, :, idx]; u_ax, v_ax = 0, 1; u_n, v_n = n[0], n[1]
         origin_sl = o + ax[2] * idx
-    # Normalize to RGBA image
+    # Vectorized red-white-blue colormap.
     vmin, vmax = float(sl.min()), float(sl.max())
-    if vmax == vmin: vmax = vmin + 1e-10
-    img = np.zeros((u_n, v_n, 4), dtype=np.uint8)
-    for i in range(u_n):
-        for j in range(v_n):
-            r, gc, b = _colormap_rwb(sl[i, j], vmin, vmax)
-            img[i, j] = [int(r*255), int(gc*255), int(b*255), 200]
+    if vmax == vmin:
+        vmax = vmin + 1e-10
+    t = np.clip((sl - vmin) / (vmax - vmin), 0.0, 1.0)
+    low = t < 0.5
+    s_low = t * 2.0
+    s_high = (t - 0.5) * 2.0
+    r = np.where(low, s_low, 1.0)
+    gc = np.where(low, s_low, 1.0 - s_high)
+    b = np.where(low, 1.0, 1.0 - s_high)
+    img = np.empty((sl.shape[0], sl.shape[1], 4), dtype=np.uint8)
+    img[..., 0] = np.clip(r * 255.0, 0, 255).astype(np.uint8)
+    img[..., 1] = np.clip(gc * 255.0, 0, 255).astype(np.uint8)
+    img[..., 2] = np.clip(b * 255.0, 0, 255).astype(np.uint8)
+    img[..., 3] = 200
     # Quad corners in 3D
     c00 = origin_sl
     c10 = origin_sl + ax[u_ax] * u_n
@@ -609,48 +894,186 @@ def _make_volume_slice(cube_data, axis=1, pos=0.5):
 # ═══════════════════════════════════════════════════════════════
 
 def _marching_cubes(grid, origin, axes, npts, isovalue):
-    """Extract triangle mesh where grid crosses isovalue."""
-    n1,n2,n3 = npts; ax = [np.array(a) for a in axes]
-    corner_offsets = [(0,0,0),(1,0,0),(1,1,0),(0,1,0),(0,0,1),(1,0,1),(1,1,1),(0,1,1)]
-    edges = [(0,1),(1,2),(2,3),(3,0),(4,5),(5,6),(6,7),(7,4),(0,4),(1,5),(2,6),(3,7)]
-    verts = []
-    for i in range(n1-1):
-        for j in range(n2-1):
-            for k in range(n3-1):
-                vals = [grid[i+di,j+dj,k+dk] for di,dj,dk in corner_offsets]
-                signs = [1 if v >= isovalue else 0 for v in vals]
-                ci = sum(s<<idx for idx,s in enumerate(signs))
-                if ci == 0 or ci == 255: continue
-                positions = [origin+(i+di)*ax[0]+(j+dj)*ax[1]+(k+dk)*ax[2] for di,dj,dk in corner_offsets]
-                edge_pts = []
-                for c1,c2 in edges:
-                    if signs[c1] != signs[c2]:
-                        t = (isovalue-vals[c1])/(vals[c2]-vals[c1]+1e-12)
-                        t = max(0.0,min(1.0,t))
-                        edge_pts.append(positions[c1]+t*(positions[c2]-positions[c1]))
-                if len(edge_pts) < 3: continue
-                centroid = np.mean(edge_pts, axis=0)
-                v1 = edge_pts[1]-edge_pts[0]; v2 = edge_pts[2]-edge_pts[0]
-                normal = np.cross(v1,v2)
-                nl = np.linalg.norm(normal)
-                normal = normal/nl if nl > 1e-10 else np.array([0,0,1])
-                for ei in range(len(edge_pts)):
-                    for p in [centroid, edge_pts[ei], edge_pts[(ei+1)%len(edge_pts)]]:
-                        verts.extend(p.tolist()); verts.extend(normal.tolist())
-    return verts
+    """Extract triangle mesh where grid crosses isovalue.
+    Vectorized: cells processed in bulk with numpy. Same approximation as
+    before — edge crossings averaged into a centroid, fan-triangulated with
+    a per-cell normal. Returns flat list pos(3)+normal(3) per vertex."""
+    n1, n2, n3 = npts
+    grid = np.asarray(grid, dtype=np.float32)
+    if grid.size == 0 or n1 < 2 or n2 < 2 or n3 < 2:
+        return []
+    origin = np.asarray(origin, dtype=np.float32)
+    ax0 = np.asarray(axes[0], dtype=np.float32)
+    ax1 = np.asarray(axes[1], dtype=np.float32)
+    ax2 = np.asarray(axes[2], dtype=np.float32)
+
+    # 8 corner values per cell, stacked as (n1-1, n2-1, n3-1, 8).
+    g = grid
+    c = np.stack([
+        g[:-1, :-1, :-1],  # 0: (0,0,0)
+        g[1: , :-1, :-1],  # 1: (1,0,0)
+        g[1: , 1: , :-1],  # 2: (1,1,0)
+        g[:-1, 1: , :-1],  # 3: (0,1,0)
+        g[:-1, :-1, 1: ],  # 4: (0,0,1)
+        g[1: , :-1, 1: ],  # 5: (1,0,1)
+        g[1: , 1: , 1: ],  # 6: (1,1,1)
+        g[:-1, 1: , 1: ],  # 7: (0,1,1)
+    ], axis=-1)
+    signs = (c >= isovalue).astype(np.uint8)
+    ci_code = np.zeros(signs.shape[:-1], dtype=np.int32)
+    for k in range(8):
+        ci_code |= (signs[..., k].astype(np.int32) << k)
+    active = (ci_code != 0) & (ci_code != 255)
+    if not np.any(active):
+        return []
+
+    # Active-cell indices.
+    ii, jj, kk = np.where(active)
+    n_cells = ii.shape[0]
+    cell_vals = c[ii, jj, kk]                  # (n_cells, 8)
+    cell_signs = signs[ii, jj, kk]             # (n_cells, 8)
+
+    # Corner positions for each cell (in world coords).
+    cell_origin = (origin[None, :]
+                   + ii[:, None] * ax0[None, :]
+                   + jj[:, None] * ax1[None, :]
+                   + kk[:, None] * ax2[None, :])  # (n_cells, 3)
+    corner_offsets = np.array([
+        [0,0,0],[1,0,0],[1,1,0],[0,1,0],
+        [0,0,1],[1,0,1],[1,1,1],[0,1,1]
+    ], dtype=np.float32)
+    # World position of each of the 8 corners per cell.
+    # corner_world = cell_origin + offset[c0]*ax0 + offset[c1]*ax1 + offset[c2]*ax2
+    cw = (cell_origin[:, None, :]
+          + corner_offsets[None, :, 0:1] * ax0[None, None, :]
+          + corner_offsets[None, :, 1:2] * ax1[None, None, :]
+          + corner_offsets[None, :, 2:3] * ax2[None, None, :])  # (n_cells, 8, 3)
+
+    edge_pairs = np.array([
+        [0,1],[1,2],[2,3],[3,0],
+        [4,5],[5,6],[6,7],[7,4],
+        [0,4],[1,5],[2,6],[3,7]
+    ], dtype=np.int32)  # (12, 2)
+    a_idx = edge_pairs[:, 0]
+    b_idx = edge_pairs[:, 1]
+    v_a = cell_vals[:, a_idx]            # (n_cells, 12)
+    v_b = cell_vals[:, b_idx]
+    s_a = cell_signs[:, a_idx]
+    s_b = cell_signs[:, b_idx]
+    crossing = (s_a != s_b)              # (n_cells, 12), True where edge crosses iso
+    t = (isovalue - v_a) / (v_b - v_a + 1e-12)
+    t = np.clip(t, 0.0, 1.0)
+    p_a = cw[:, a_idx, :]                # (n_cells, 12, 3)
+    p_b = cw[:, b_idx, :]
+    edge_pts = p_a + t[:, :, None] * (p_b - p_a)   # (n_cells, 12, 3)
+
+    # For each cell: number of crossings, centroid (mean of crossings),
+    # and a per-cell normal from the first triangle of crossings.
+    crossing_f = crossing.astype(np.float32)
+    n_cross = crossing_f.sum(axis=1)                       # (n_cells,)
+    valid = n_cross >= 3
+    if not np.any(valid):
+        return []
+
+    # Zero-out non-crossing entries so the mean ignores them.
+    edge_masked = edge_pts * crossing_f[:, :, None]
+    centroid = edge_masked.sum(axis=1) / np.maximum(n_cross[:, None], 1.0)  # (n_cells, 3)
+
+    # Build a normal per cell using the first 3 crossing points.
+    # Convert the per-cell boolean mask into an ordered (n_cells, 12) of
+    # crossing-index → original edge index via argsort, so we can pick the
+    # first three crossings cheaply.
+    order = np.argsort(-crossing_f, axis=1, kind='stable')   # crossings come first
+    e0 = order[:, 0]; e1 = order[:, 1]; e2 = order[:, 2]
+    rows = np.arange(n_cells)
+    p0 = edge_pts[rows, e0]
+    p1 = edge_pts[rows, e1]
+    p2 = edge_pts[rows, e2]
+    v1 = p1 - p0; v2 = p2 - p0
+    normal = np.cross(v1, v2)
+    nlen = np.linalg.norm(normal, axis=1, keepdims=True)
+    safe = nlen[:, 0] > 1e-10
+    normal = np.where(nlen > 1e-10, normal / np.maximum(nlen, 1e-12),
+                      np.array([0.0, 0.0, 1.0], dtype=np.float32))
+
+    # Now emit triangles: for each cell, fan (centroid, e_i, e_(i+1)) for
+    # each consecutive crossing pair. Variable n_cross per cell ⇒ loop over
+    # the small number of distinct crossing counts (≤12).
+    out_chunks = []
+    crossing_counts = np.unique(n_cross[valid].astype(np.int32))
+    for cnt in crossing_counts:
+        if cnt < 3:
+            continue
+        sel = np.where((n_cross.astype(np.int32) == cnt) & valid)[0]
+        if sel.size == 0:
+            continue
+        # First `cnt` crossings per selected cell, in stable order.
+        ord_sel = order[sel, :cnt]           # (m, cnt)
+        rows_sel = np.repeat(sel[:, None], cnt, axis=1)
+        pts = edge_pts[rows_sel, ord_sel]    # (m, cnt, 3)
+        cent = centroid[sel]                 # (m, 3)
+        nrm  = normal[sel]                   # (m, 3)
+        m = sel.size
+        # For each crossing edge i: triangle = (centroid, pts[i], pts[(i+1)%cnt])
+        next_pts = np.roll(pts, -1, axis=1)
+        # Stack: (m, cnt, 3 verts, 3 coords)
+        tris = np.empty((m, cnt, 3, 3), dtype=np.float32)
+        tris[:, :, 0, :] = cent[:, None, :]
+        tris[:, :, 1, :] = pts
+        tris[:, :, 2, :] = next_pts
+        nrm_tile = np.broadcast_to(nrm[:, None, None, :], (m, cnt, 3, 3))
+        block = np.concatenate([tris, nrm_tile], axis=-1)   # (m, cnt, 3, 6)
+        out_chunks.append(block.reshape(-1, 6))
+    if not out_chunks:
+        return []
+    flat = np.concatenate(out_chunks, axis=0).ravel()
+    return flat.tolist()
+
+def _color_verts(raw_pos_norm, color_rgb):
+    """Take a flat list of pos+normal floats from _marching_cubes and
+    splice a per-vertex color in via numpy reshape (much faster than
+    list .extend in a Python loop).
+    Returns flat list of pos(3)+normal(3)+color(3)."""
+    if not raw_pos_norm:
+        return []
+    arr = np.asarray(raw_pos_norm, dtype=np.float32).reshape(-1, 6)
+    out = np.empty((arr.shape[0], 9), dtype=np.float32)
+    out[:, :6] = arr
+    out[:, 6] = color_rgb[0]
+    out[:, 7] = color_rgb[1]
+    out[:, 8] = color_rgb[2]
+    return out.ravel().tolist()
+
+def _verts_to_array(raw_pos_norm, color_rgb):
+    """Same as _color_verts but returns a numpy (N, 9) array."""
+    if not raw_pos_norm:
+        return np.zeros((0, 9), dtype=np.float32)
+    arr = np.asarray(raw_pos_norm, dtype=np.float32).reshape(-1, 6)
+    out = np.empty((arr.shape[0], 9), dtype=np.float32)
+    out[:, :6] = arr
+    out[:, 6] = color_rgb[0]
+    out[:, 7] = color_rgb[1]
+    out[:, 8] = color_rgb[2]
+    return out
+
+def _center_verts_array(arr, center):
+    if arr.shape[0] == 0:
+        return arr
+    out = arr.copy()
+    out[:, 0] -= center[0]
+    out[:, 1] -= center[1]
+    out[:, 2] -= center[2]
+    return out
 
 def cube_isosurface(cube_data, isovalue=0.02):
     """Generate colored triangle mesh from cube data. Returns pos(3)+normal(3)+color(3) floats."""
-    g,o,ax,n = cube_data['grid'],cube_data['origin'],cube_data['axes'],cube_data['npts']
+    g, o, ax, n = cube_data['grid'], cube_data['origin'], cube_data['axes'], cube_data['npts']
     col_pos, col_neg = _hex(0x3070CC), _hex(0xCC3030)
-    pos_raw = _marching_cubes(g, o, ax, n, isovalue)
-    neg_raw = _marching_cubes(g, o, ax, n, -isovalue)
-    result = []
-    for i in range(0, len(pos_raw), 6):
-        result.extend(pos_raw[i:i+6]); result.extend(col_pos)
-    for i in range(0, len(neg_raw), 6):
-        result.extend(neg_raw[i:i+6]); result.extend(col_neg)
-    return result
+    pos_arr = _verts_to_array(_marching_cubes(g, o, ax, n, isovalue), col_pos)
+    neg_arr = _verts_to_array(_marching_cubes(g, o, ax, n, -isovalue), col_neg)
+    if pos_arr.shape[0] == 0 and neg_arr.shape[0] == 0:
+        return []
+    return np.concatenate([pos_arr, neg_arr], axis=0).ravel().tolist()
 
 # ═══════════════════════════════════════════════════════════════
 #  ORBITAL LOBE MESH (approximate — for presets without cube)
@@ -743,8 +1166,33 @@ class MolViewer(QWidget):
         self._overlays = OrderedDict()
         # Measurements: list of (type, indices, value)
         self._measurements = []
+        # Busy state (number of in-flight background tasks).
+        self._busy_count = 0
+        self._busy_phase = 0.0   # animated phase for spinner
+        self._busy_label = ""
+        # Hook into the global task manager so the spinner reflects
+        # background work without each subsystem having to wire it up.
+        try:
+            sig = tasks().signals
+            sig.busy_changed.connect(self._on_tasks_busy)
+            sig.started.connect(self._on_task_started)
+        except Exception:
+            pass
         # Timer
         self.timer=QTimer(self); self.timer.timeout.connect(self._tick); self.timer.setInterval(16)
+
+    @Slot(int)
+    def _on_tasks_busy(self, n):
+        self._busy_count = int(n)
+        if n == 0:
+            self._busy_label = ""
+
+    @Slot(str)
+    def _on_task_started(self, tag):
+        # tag format: "label#id#timestamp"
+        label = tag.split('#', 1)[0] if tag else ''
+        if label:
+            self._busy_label = label
 
     def _ensure_gl(self):
         if self._gl_ready: return
@@ -917,47 +1365,62 @@ class MolViewer(QWidget):
 
     def _rebuild_mol(self):
         if not self._gl_ready or not self.atoms: return
-        cx,cy,cz=self._center; all_v=[]
-        scale=2.2 if self.render_style=='spacefill' else 1.0
-        segs=24 if len(self.atoms)>30 else 32
-        for idx,a in enumerate(self.atoms):
-            el=ELEMENTS.get(a['el'],{'color':0x888888,'r':0.5})
-            r=el['r']*0.4*scale if self.render_style!='wireframe' else 0.12
-            col=el['color']
-            if self.selected_atom==idx:
-                rr,gg,bb=_hex(col)
-                col=(min(int((rr+0.3)*255),255)<<16)|(min(int((gg+0.3)*255),255)<<8)|min(int((bb+0.3)*255),255)
-            sp=_make_sphere(r,segs,segs//2,col)
-            t=glm.translate(glm.mat4(1),glm.vec3(a['x']-cx,a['y']-cy,a['z']-cz))
-            all_v.extend(_transform_verts(sp,t))
-        if self.show_bonds and self.render_style!='spacefill':
-            br=0.025 if self.render_style=='wireframe' else 0.06
-            for i,j in self.bonds:
-                a1,a2=self.atoms[i],self.atoms[j]
-                s=glm.vec3(a1['x']-cx,a1['y']-cy,a1['z']-cz)
-                e=glm.vec3(a2['x']-cx,a2['y']-cy,a2['z']-cz)
-                mid=(s+e)*0.5; diff=e-s; length=glm.length(diff)
-                if length<0.01: continue
-                d=glm.normalize(diff); cyl=_make_cylinder(br,length,8,0x778899)
-                up=glm.vec3(0,1,0)
-                if abs(glm.dot(up,d))>0.999:
-                    rm=glm.mat4(1) if d.y>0 else glm.rotate(glm.mat4(1),math.pi,glm.vec3(1,0,0))
+        cx, cy, cz = self._center
+        scale = 2.2 if self.render_style == 'spacefill' else 1.0
+        segs = 24 if len(self.atoms) > 30 else 32
+        chunks = []
+
+        # Atoms — vectorized per atom, then concatenated.
+        for idx, a in enumerate(self.atoms):
+            el = ELEMENTS.get(a['el'], {'color': 0x888888, 'r': 0.5})
+            r = el['r'] * 0.4 * scale if self.render_style != 'wireframe' else 0.12
+            col = el['color']
+            if self.selected_atom == idx:
+                rr, gg, bb = _hex(col)
+                col = ((min(int((rr+0.3)*255), 255) << 16)
+                       | (min(int((gg+0.3)*255), 255) << 8)
+                       |  min(int((bb+0.3)*255), 255))
+            sp = _make_sphere_array(r, segs, segs // 2, col)
+            t = glm.translate(glm.mat4(1), glm.vec3(a['x']-cx, a['y']-cy, a['z']-cz))
+            chunks.append(_transform_verts_array(sp, t))
+
+        # Bonds — share a single cylinder template per render style.
+        if self.show_bonds and self.render_style != 'spacefill' and self.bonds:
+            br = 0.025 if self.render_style == 'wireframe' else 0.06
+            for i, j in self.bonds:
+                a1, a2 = self.atoms[i], self.atoms[j]
+                s = glm.vec3(a1['x']-cx, a1['y']-cy, a1['z']-cz)
+                e = glm.vec3(a2['x']-cx, a2['y']-cy, a2['z']-cz)
+                mid = (s+e)*0.5; diff = e-s; length = glm.length(diff)
+                if length < 0.01: continue
+                d = glm.normalize(diff)
+                cyl = _make_cylinder_array(br, length, 8, 0x778899)
+                up = glm.vec3(0, 1, 0)
+                if abs(glm.dot(up, d)) > 0.999:
+                    rm = glm.mat4(1) if d.y > 0 else glm.rotate(glm.mat4(1), math.pi, glm.vec3(1, 0, 0))
                 else:
-                    ax=glm.normalize(glm.cross(up,d))
-                    ang=math.acos(max(-1,min(1,glm.dot(up,d))))
-                    rm=glm.rotate(glm.mat4(1),ang,ax)
-                all_v.extend(_transform_verts(cyl,glm.translate(glm.mat4(1),mid)*rm))
-        if not all_v: self._mol_vao=None; self._mol_n=0; return
-        data=np.array(all_v,dtype='f4').tobytes()
+                    ax = glm.normalize(glm.cross(up, d))
+                    ang = math.acos(max(-1, min(1, glm.dot(up, d))))
+                    rm = glm.rotate(glm.mat4(1), ang, ax)
+                chunks.append(_transform_verts_array(cyl, glm.translate(glm.mat4(1), mid) * rm))
+
+        if not chunks:
+            self._mol_vao = None; self._mol_n = 0; return
+        all_v = np.concatenate(chunks, axis=0).astype(np.float32, copy=False)
+        data = all_v.tobytes()
         if self._mol_vao:
             try: self._mol_vao.release()
             except: pass
-        vbo=self.ctx.buffer(data)
-        self._mol_vao=self.ctx.vertex_array(self.prog_lit,[(vbo,'3f 3f 3f','in_position','in_normal','in_color')])
-        self._mol_n=len(all_v)//9
+        vbo = self.ctx.buffer(data)
+        self._mol_vao = self.ctx.vertex_array(
+            self.prog_lit,
+            [(vbo, '3f 3f 3f', 'in_position', 'in_normal', 'in_color')])
+        self._mol_n = all_v.shape[0]
 
     def _tick(self):
         if not self._dragging: self.auto_rot+=0.006
+        if self._busy_count > 0:
+            self._busy_phase = (self._busy_phase + 0.18) % (2*math.pi)
         self._render(); self.update()
 
     def _render(self):
@@ -1044,7 +1507,49 @@ class MolViewer(QWidget):
         for name, fn in self._overlays.items():
             try: fn(p, w, h)
             except: pass
+        # Busy spinner overlay — shown whenever background work is active.
+        if self._busy_count > 0:
+            self._draw_busy_spinner(p, w, h)
         p.end()
+
+    def _draw_busy_spinner(self, p, w, h):
+        """Animated spinner + label pinned to the top-right of the viewer.
+        Indicates that at least one async task is in flight."""
+        pad = 14
+        size = 22
+        cx = w - pad - size // 2
+        cy = pad + size // 2
+        # Pill background.
+        label = self._busy_label or "working"
+        suffix = f"  ({self._busy_count})" if self._busy_count > 1 else ""
+        text = f"{label}{suffix}"
+        p.setFont(QFont("Consolas", 9, QFont.Bold))
+        fm = p.fontMetrics()
+        tw = fm.horizontalAdvance(text)
+        pill_w = size + 12 + tw + 16
+        pill_h = max(size + 8, 28)
+        pill_x = w - pad - pill_w
+        pill_y = pad - 4
+        p.setPen(Qt.NoPen)
+        p.setBrush(QColor(255, 255, 255, 225))
+        p.drawRoundedRect(pill_x, pill_y, pill_w, pill_h, pill_h // 2, pill_h // 2)
+        # Spinner — 8 dots around a circle, fading by lag from current phase.
+        ring_cx = pill_x + 6 + size // 2
+        ring_cy = pill_y + pill_h // 2
+        r_outer = size // 2 - 2
+        n = 8
+        for i in range(n):
+            ang = -self._busy_phase + i * (2 * math.pi / n)
+            dx = math.cos(ang) * r_outer
+            dy = math.sin(ang) * r_outer
+            # Fade with i so leading dot is brightest.
+            alpha = int(240 * (1.0 - i / n) ** 1.4 + 25)
+            p.setBrush(QColor(60, 120, 200, alpha))
+            p.drawEllipse(int(ring_cx + dx) - 2, int(ring_cy + dy) - 2, 4, 4)
+        # Label.
+        p.setPen(QColor(50, 70, 100))
+        p.drawText(pill_x + size + 12, pill_y, tw + 6, pill_h,
+                   Qt.AlignVCenter | Qt.AlignLeft, text)
 
     @staticmethod
     def _epos(e):
@@ -1144,6 +1649,74 @@ class ChemLab:
         self._signals = _Signals()
         self._mo_defs = []  # LCAO MO definitions for current molecule
         self._cube_data = None
+        # Per-instance dispatch table for async result handlers.
+        self._async_handlers = {}
+        # Hook into the global task manager so we receive results on the
+        # GUI thread (Qt auto-marshals signal emissions across threads).
+        tm = tasks()
+        tm.signals.finished.connect(self._on_async_finished)
+        tm.signals.failed.connect(self._on_async_failed)
+
+    # ── Async dispatch ─────────────────────────────────────────
+
+    def _async(self, label, work_fn, on_done):
+        """Submit `work_fn()` to the thread pool. When it completes the
+        result is delivered to `on_done(result)` on the GUI thread, so
+        Qt/GL calls are safe inside on_done.
+
+        `label` should be unique per task; it shows up in the spinner."""
+        tag = f"{label}#{id(work_fn)}#{time.time_ns()}"
+        self._async_handlers[tag] = (label, on_done)
+        self.log(f"⏳ {label} …")
+        tasks().submit(tag, work_fn)
+
+    def _needs_calc(self, name, then_fn):
+        """If a calculate() job is in flight, queue `then_fn()` to run once
+        it completes. If results are already available, run it inline.
+        If no calc has ever run, log a hint.
+        Lets the LLM write `chem.calculate(); chem.show_homo()` and have
+        it Just Work, with the second call deferred to GUI-thread post-calc."""
+        if hasattr(self, '_pyscf_mf'):
+            then_fn()
+            return self
+        if getattr(self, '_calc_pending', False):
+            self._post_calc_q = getattr(self, '_post_calc_q', [])
+            self._post_calc_q.append((name, then_fn))
+            self.log(f"⏳ {name} queued behind calculate")
+            return self
+        self.log(f"Run chem.calculate() first (needed by {name})")
+        return self
+
+    def _on_async_finished(self, tag, result):
+        h = self._async_handlers.pop(tag, None)
+        if h is None:
+            return
+        label, on_done = h
+        try:
+            on_done(result)
+            self.log(f"✓ {label} done")
+        except Exception as ex:
+            self.log(f"✗ {label} display error: {ex}")
+        # Drain post-calc queue if calculate just finished.
+        if label == 'calculate' and getattr(self, '_post_calc_q', None):
+            q = self._post_calc_q; self._post_calc_q = []
+            for name, fn in q:
+                try: fn()
+                except Exception as ex: self.log(f"✗ queued {name}: {ex}")
+
+    def _on_async_failed(self, tag, err):
+        h = self._async_handlers.pop(tag, None)
+        if h is None:
+            return
+        label, _ = h
+        self.log(f"✗ {label} failed: {err.splitlines()[0]}")
+        if label == 'calculate':
+            self._calc_pending = False
+            # Drop queued calc-dependent jobs to avoid running them stale.
+            if getattr(self, '_post_calc_q', None):
+                for name, _fn in self._post_calc_q:
+                    self.log(f"  ↳ skipping queued {name} (calc failed)")
+                self._post_calc_q = []
 
     def log(self, msg):
         if self._log: self._log.append(f"[chem] {msg}")
@@ -1208,27 +1781,60 @@ class ChemLab:
         return self
 
     def load_cube(self, path_or_data, isovalue=0.02):
-        """Load cube file — from file path (str) or pre-parsed dict."""
-        if isinstance(path_or_data, str):
-            path = os.path.expanduser(path_or_data)
-            with open(path, 'r') as f: text = f.read()
-            cube = parse_cube(text)
-            name = os.path.basename(path)
-        elif isinstance(path_or_data, dict):
+        """Load cube file — from file path (str, async) or pre-parsed dict (sync)."""
+        if isinstance(path_or_data, dict):
+            # Already parsed — apply on the spot.
             cube = path_or_data
             name = "cube data"
-        else:
+            self._cube_data = cube
+            self.atoms = cube['atoms']
+            self.bonds = detect_bonds(self.atoms)
+            self.viewer.set_molecule(self.atoms, name)
+            self.viewer.set_cube(cube, isovalue)
+            n = cube['npts']
+            self.info = {'name': name, 'source': 'cube', 'grid': f"{n[0]}x{n[1]}x{n[2]}"}
+            self.log(f"Loaded cube: {name} ({n[0]}×{n[1]}×{n[2]} grid)")
+            return self
+
+        if not isinstance(path_or_data, str):
             self.log("load_cube: pass a file path or parsed dict"); return self
-        if cube is None:
-            self.log("Failed to parse cube file"); return self
-        self._cube_data = cube
-        self.atoms = cube['atoms']
-        self.bonds = detect_bonds(self.atoms)
-        self.viewer.set_molecule(self.atoms, name)
-        self.viewer.set_cube(cube, isovalue)
-        n = cube['npts']
-        self.info = {'name': name, 'source': 'cube', 'grid': f"{n[0]}x{n[1]}x{n[2]}"}
-        self.log(f"Loaded cube: {name} ({n[0]}×{n[1]}×{n[2]} grid)")
+
+        path = os.path.expanduser(path_or_data)
+        name = os.path.basename(path)
+
+        def _work():
+            with open(path, 'r') as f:
+                text = f.read()
+            cube = parse_cube(text)
+            if cube is None:
+                raise RuntimeError("Failed to parse cube file")
+            # Pre-compute the iso mesh here so the GUI thread only does the
+            # tiny GL upload.
+            verts = cube_isosurface(cube, isovalue)
+            return {'cube': cube, 'name': name, 'verts': verts}
+
+        def _apply(r):
+            cube = r['cube']
+            self._cube_data = cube
+            self.atoms = cube['atoms']
+            self.bonds = detect_bonds(self.atoms)
+            self.viewer.set_molecule(self.atoms, r['name'])
+            # Upload the pre-computed iso mesh.
+            verts = r['verts']
+            if verts:
+                cx, cy, cz = self.viewer._center
+                arr = np.array(verts, dtype=np.float32).reshape(-1, 9)
+                if cx or cy or cz:
+                    arr[:, 0] -= cx; arr[:, 1] -= cy; arr[:, 2] -= cz
+                self.viewer.set_orbital_mesh(arr.ravel().tolist())
+            else:
+                self.viewer.clear_orbital()
+            n = cube['npts']
+            self.info = {'name': r['name'], 'source': 'cube',
+                         'grid': f"{n[0]}x{n[1]}x{n[2]}"}
+            self.log(f"Loaded cube: {r['name']} ({n[0]}×{n[1]}×{n[2]} grid)")
+
+        self._async('load_cube', _work, _apply)
         return self
 
     def load_smiles(self, smiles):
@@ -1456,7 +2062,7 @@ class ChemLab:
 
     def calculate(self, method="B3LYP", basis="sto-3g", charge=0, mult=1,
                   freq=False, cube=False, cube_nx=50, opt=False):
-        """Run a real quantum chemistry calculation using PySCF.
+        """Run a real quantum chemistry calculation using PySCF (asynchronously).
 
         Args:
             method: 'HF', 'B3LYP', 'PBE', 'PBE0', 'M06-2X', 'MP2', etc.
@@ -1468,9 +2074,10 @@ class ChemLab:
             cube_nx: cube file grid resolution per axis
             opt:    if True, optimize geometry first
 
-        After calling, chem.info is populated with REAL computed data:
-            energy, homo_energy, lumo_energy, gap, dipole, charges,
-            mo_energies, n_occ, frequencies (if freq=True)
+        The call returns immediately. Heavy compute happens on a worker
+        thread; chem.info is populated when it finishes. Chained calls
+        like `chem.calculate().show_homo()` are still safe — anything that
+        requires the SCF result is queued and runs once the calc finishes.
 
         Returns: self (for chaining)
         """
@@ -1478,235 +2085,253 @@ class ChemLab:
             self.log("No molecule loaded"); return self
 
         try:
-            from pyscf import gto, scf, dft
-            import numpy as np
+            from pyscf import gto, scf, dft  # noqa: F401
         except ImportError:
             self.log("PySCF not installed: pip install pyscf"); return self
 
-        self.log(f"Calculating {method}/{basis} on {len(self.atoms)} atoms ...")
-        self.log(f"  Elements: {set(a['el'] for a in self.atoms)}")
-
-        # Build PySCF molecule — filter out dummy/unknown atoms that PySCF can't handle
+        # Snapshot the inputs the worker needs (avoid sharing self.atoms).
         _pyscf_valid = set('H He Li Be B C N O F Ne Na Mg Al Si P S Cl Ar '
                           'K Ca Sc Ti V Cr Mn Fe Co Ni Cu Zn Ga Ge As Se Br Kr '
                           'Rb Sr Y Zr Nb Mo Tc Ru Rh Pd Ag Cd In Sn Sb Te I Xe '
                           'Cs Ba La Hf Ta W Re Os Ir Pt Au Hg Tl Pb Bi U'.split())
-        calc_atoms = [a for a in self.atoms if a['el'] in _pyscf_valid]
+        calc_atoms = [dict(a) for a in self.atoms if a['el'] in _pyscf_valid]
         if not calc_atoms:
             self.log("No valid atoms for PySCF — all atoms are unknown/dummy")
-            self.log(f"  Atom elements: {[a['el'] for a in self.atoms]}")
             return self
         if len(calc_atoms) < len(self.atoms):
             skipped = len(self.atoms) - len(calc_atoms)
             bad_els = set(a['el'] for a in self.atoms if a['el'] not in _pyscf_valid)
             self.log(f"Skipping {skipped} atom(s) with unsupported elements: {bad_els}")
-        atom_str = "; ".join(f"{a['el']} {a['x']} {a['y']} {a['z']}" for a in calc_atoms)
-        try:
-            mol = gto.M(atom=atom_str, basis=basis, charge=charge, spin=mult-1, unit='Angstrom', verbose=0)
-        except Exception as ex:
-            err_msg = str(ex)
-            if 'Basis' in err_msg or 'basis' in err_msg:
-                # Basis set doesn't cover some element — try per-element basis assignment
-                self.log(f"Basis '{basis}' failed: {err_msg}")
-                unique_els = set(a['el'] for a in calc_atoms)
-                self.log(f"  Elements: {unique_els}. Trying fallback with def2-svp...")
-                try:
+
+        self.log(f"Calculating {method}/{basis} on {len(calc_atoms)} atoms ...")
+        self.log(f"  Elements: {set(a['el'] for a in calc_atoms)}")
+        self._calc_pending = True
+
+        full_atom_count = len(self.atoms)
+
+        def _work():
+            from pyscf import gto, scf, dft
+            import numpy as _np
+            # Build molecule.
+            atom_str = "; ".join(f"{a['el']} {a['x']} {a['y']} {a['z']}" for a in calc_atoms)
+            cur_basis = basis
+            try:
+                mol = gto.M(atom=atom_str, basis=cur_basis, charge=charge,
+                            spin=mult-1, unit='Angstrom', verbose=0)
+            except Exception as ex:
+                err_msg = str(ex)
+                if 'Basis' in err_msg or 'basis' in err_msg:
                     mol = gto.M(atom=atom_str, basis='def2-svp', charge=charge,
                                 spin=mult-1, unit='Angstrom', verbose=0)
-                    basis = 'def2-svp'
-                    self.log(f"  Fallback to def2-svp succeeded")
-                except Exception as ex2:
-                    self.log(f"Fallback basis also failed: {ex2}"); return self
+                    cur_basis = 'def2-svp'
+                else:
+                    raise
+            # Pick method.
+            meth_up = method.upper()
+            mp2_corr = None
+            if meth_up == 'HF':
+                mf = scf.UHF(mol) if mult > 1 else scf.RHF(mol)
+            elif meth_up == 'MP2':
+                mf = scf.RHF(mol).run(verbose=0)
+                from pyscf import mp
+                pt = mp.MP2(mf).run(verbose=0)
+                mp2_corr = float(pt.e_corr)
             else:
-                self.log(f"PySCF error building molecule: {ex}"); return self
-
-        # Choose method
-        meth_up = method.upper()
-        if meth_up == 'HF':
-            if mult > 1: mf = scf.UHF(mol)
-            else: mf = scf.RHF(mol)
-        elif meth_up == 'MP2':
-            mf = scf.RHF(mol).run(verbose=0)
-            from pyscf import mp
-            pt = mp.MP2(mf).run(verbose=0)
-            # MP2 doesn't have orbital-level output, use HF orbitals
-            self.info['mp2_corr'] = pt.e_corr
-            self.log(f"MP2 correlation: {pt.e_corr:.6f} Eh")
-            # Fall through to use mf for orbitals
-        else:
-            # DFT
-            if mult > 1: mf = dft.UKS(mol)
-            else: mf = dft.RKS(mol)
-            mf.xc = method.lower()
-
-        # Geometry optimization
-        if opt:
-            self.log("Optimizing geometry...")
+                mf = dft.UKS(mol) if mult > 1 else dft.RKS(mol)
+                mf.xc = method.lower()
+            # Optional geometry optimization.
+            opt_coords = None
+            if opt:
+                try:
+                    from pyscf.geomopt import geometric_solver
+                    mol_eq = geometric_solver.optimize(mf, verbose=0)
+                    opt_coords = mol_eq.atom_coords(unit='Angstrom')
+                    atom_str = "; ".join(
+                        f"{calc_atoms[i]['el']} {opt_coords[i][0]} {opt_coords[i][1]} {opt_coords[i][2]}"
+                        for i in range(len(calc_atoms)))
+                    mol = gto.M(atom=atom_str, basis=cur_basis, charge=charge,
+                                spin=mult-1, unit='Angstrom', verbose=0)
+                    if meth_up == 'HF':
+                        mf = scf.RHF(mol) if mult == 1 else scf.UHF(mol)
+                    else:
+                        mf = dft.RKS(mol) if mult == 1 else dft.UKS(mol)
+                        mf.xc = method.lower()
+                except Exception as ex:
+                    opt_coords = None
+                    _opt_err = str(ex)
+            # SCF.
+            mf.run(verbose=0)
+            n_occ = mol.nelectron // 2
+            mo_eV = mf.mo_energy * 27.2114
             try:
-                from pyscf.geomopt import geometric_solver
-                mol_eq = geometric_solver.optimize(mf, verbose=0)
-                # Update atoms with optimized coordinates
-                coords = mol_eq.atom_coords(unit='Angstrom')
-                for i, a in enumerate(self.atoms):
-                    a['x'], a['y'], a['z'] = float(coords[i][0]), float(coords[i][1]), float(coords[i][2])
+                charges_raw = mf.mulliken_pop(verbose=0)[1]
+                charges = [float(c) for c in charges_raw]
+            except Exception:
+                charges = [0.0] * full_atom_count
+            try:
+                dip = mf.dip_moment(verbose=0)
+                dipole_mag = float(_np.linalg.norm(dip))
+            except Exception:
+                dipole_mag = 0.0
+            # Frequencies.
+            freqs_out = None
+            ir_ints_out = None
+            if freq:
+                try:
+                    h = mf.Hessian().kernel()
+                    from pyscf.hessian import thermo
+                    results = thermo.harmonic_analysis(mol, h)
+                    freqs_all = results['freq_wavenumber']
+                    freqs_out = [float(f) for f in freqs_all if f > 0]
+                    ir_ints_out = [10.0] * len(freqs_out)
+                    try:
+                        from pyscf.prop import infrared
+                        ir = infrared.Infrared(mf).kernel()
+                        if hasattr(ir, 'ir_inten'):
+                            ir_ints_out = [float(x) for x in ir.ir_inten[:len(freqs_out)]]
+                    except Exception:
+                        pass
+                except Exception:
+                    pass
+            # Cubes.
+            homo_path = lumo_path = cube_dir = None
+            if cube:
+                try:
+                    from pyscf.tools import cubegen
+                    import tempfile
+                    cube_dir = tempfile.mkdtemp(prefix="chemlab_")
+                    homo_path = os.path.join(cube_dir, "homo.cube")
+                    lumo_path = os.path.join(cube_dir, "lumo.cube")
+                    cubegen.orbital(mol, homo_path, mf.mo_coeff[:, n_occ-1],
+                                    nx=cube_nx, ny=cube_nx, nz=cube_nx)
+                    cubegen.orbital(mol, lumo_path, mf.mo_coeff[:, n_occ],
+                                    nx=cube_nx, ny=cube_nx, nz=cube_nx)
+                except Exception:
+                    homo_path = lumo_path = cube_dir = None
+            return {
+                'mol': mol, 'mf': mf, 'basis': cur_basis,
+                'n_occ': n_occ, 'mo_eV': mo_eV, 'charges': charges,
+                'dipole_mag': dipole_mag, 'mp2_corr': mp2_corr,
+                'opt_coords': opt_coords,
+                'frequencies': freqs_out, 'ir_intensities': ir_ints_out,
+                'homo_cube': homo_path, 'lumo_cube': lumo_path,
+                'cube_dir': cube_dir,
+            }
+
+        def _apply(r):
+            self._calc_pending = False
+            mf = r['mf']; mol = r['mol']
+            n_occ = r['n_occ']; mo_eV = r['mo_eV']
+            self._pyscf_mf = mf; self._pyscf_mol = mol
+            # Apply optimized geometry, if any, on the GUI thread.
+            if r['opt_coords'] is not None:
+                for i in range(min(len(self.atoms), len(r['opt_coords']))):
+                    if self.atoms[i]['el'] in _pyscf_valid:
+                        cx, cy, cz = r['opt_coords'][i]
+                        self.atoms[i]['x'] = float(cx)
+                        self.atoms[i]['y'] = float(cy)
+                        self.atoms[i]['z'] = float(cz)
                 self.bonds = detect_bonds(self.atoms)
                 self.viewer.set_molecule(self.atoms, self.viewer.mol_name)
-                # Rebuild mol/mf with optimized geometry
-                atom_str = "; ".join(f"{a['el']} {a['x']} {a['y']} {a['z']}" for a in self.atoms)
-                mol = gto.M(atom=atom_str, basis=basis, charge=charge, spin=mult-1, unit='Angstrom', verbose=0)
-                if meth_up == 'HF':
-                    mf = scf.RHF(mol) if mult == 1 else scf.UHF(mol)
-                else:
-                    mf = dft.RKS(mol) if mult == 1 else dft.UKS(mol)
-                    mf.xc = method.lower()
-                self.log("Geometry optimized")
-            except Exception as ex:
-                self.log(f"Optimization failed: {ex}, continuing with current geometry")
-
-        # Run SCF
-        mf.run(verbose=0)
-
-        if not mf.converged:
-            self.log("WARNING: SCF did not converge!")
-
-        # Extract results
-        n_occ = mol.nelectron // 2
-        mo_eV = mf.mo_energy * 27.2114  # Hartree to eV
-
-        # Mulliken charges
-        try:
-            charges_raw = mf.mulliken_pop(verbose=0)[1]
-            charges = [float(c) for c in charges_raw]
-        except:
-            charges = [0.0] * len(self.atoms)
-
-        # Dipole
-        try:
-            dip = mf.dip_moment(verbose=0)
-            dipole_mag = float(np.linalg.norm(dip))
-        except:
-            dipole_mag = 0.0
-
-        # Store everything
-        self.info.update({
-            'energy': float(mf.e_tot),
-            'method': f"{method}/{basis}",
-            'basis': basis,
-            'scf_ok': mf.converged,
-            'homo_energy': float(mo_eV[n_occ-1]),
-            'lumo_energy': float(mo_eV[n_occ]) if n_occ < len(mo_eV) else None,
-            'gap': float(mo_eV[n_occ] - mo_eV[n_occ-1]) if n_occ < len(mo_eV) else None,
-            'dipole': dipole_mag,
-            'charges': charges,
-            'mulliken': [{'idx':i,'el':self.atoms[i]['el'],'charge':charges[i]} for i in range(len(charges))],
-            'mo_energies': [float(e) for e in mo_eV],
-            'n_occ': n_occ,
-            'n_mo': len(mo_eV),
-        })
-        self._pyscf_mf = mf   # keep reference for orbital generation
-        self._pyscf_mol = mol
-
-        self.log(f"Energy: {mf.e_tot:.8f} Eh")
-        self.log(f"HOMO: {mo_eV[n_occ-1]:.3f} eV  LUMO: {mo_eV[n_occ]:.3f} eV  gap: {mo_eV[n_occ]-mo_eV[n_occ-1]:.3f} eV")
-        self.log(f"Dipole: {dipole_mag:.4f} Debye")
-
-        # Frequencies
-        if freq:
-            self.log("Computing frequencies...")
-            try:
-                h = mf.Hessian().kernel()
-                from pyscf.hessian import thermo
-                results = thermo.harmonic_analysis(mol, h)
-                freqs_all = results['freq_wavenumber']
-                real_freqs = [float(f) for f in freqs_all if f > 0]
-                # IR intensities from dipole derivatives (approximate)
-                ir_ints = [10.0] * len(real_freqs)  # PySCF doesn't compute IR intensities directly
-                # But we can get them from dipole derivative if available
+            if r['mp2_corr'] is not None:
+                self.info['mp2_corr'] = r['mp2_corr']
+                self.log(f"MP2 correlation: {r['mp2_corr']:.6f} Eh")
+            self.info.update({
+                'energy': float(mf.e_tot),
+                'method': f"{method}/{r['basis']}",
+                'basis': r['basis'],
+                'scf_ok': bool(mf.converged),
+                'homo_energy': float(mo_eV[n_occ-1]),
+                'lumo_energy': float(mo_eV[n_occ]) if n_occ < len(mo_eV) else None,
+                'gap': float(mo_eV[n_occ] - mo_eV[n_occ-1]) if n_occ < len(mo_eV) else None,
+                'dipole': r['dipole_mag'],
+                'charges': r['charges'],
+                'mulliken': [{'idx': i, 'el': self.atoms[i]['el'],
+                              'charge': r['charges'][i] if i < len(r['charges']) else 0.0}
+                             for i in range(len(self.atoms))],
+                'mo_energies': [float(e) for e in mo_eV],
+                'n_occ': n_occ,
+                'n_mo': len(mo_eV),
+            })
+            if not mf.converged:
+                self.log("WARNING: SCF did not converge!")
+            self.log(f"Energy: {mf.e_tot:.8f} Eh")
+            if n_occ < len(mo_eV):
+                self.log(f"HOMO: {mo_eV[n_occ-1]:.3f} eV  LUMO: {mo_eV[n_occ]:.3f} eV  "
+                         f"gap: {mo_eV[n_occ]-mo_eV[n_occ-1]:.3f} eV")
+            self.log(f"Dipole: {r['dipole_mag']:.4f} Debye")
+            if r['frequencies'] is not None:
+                self.info['frequencies'] = r['frequencies']
+                self.info['ir_intensities'] = r['ir_intensities']
+                head = ', '.join(f'{f:.0f}' for f in r['frequencies'][:6])
+                tail = '...' if len(r['frequencies']) > 6 else ''
+                self.log(f"Frequencies: {head}{tail} cm-1")
+            if r['homo_cube']:
+                self.info['homo_cube'] = r['homo_cube']
+                self.info['lumo_cube'] = r['lumo_cube']
+                self.info['cube_dir'] = r['cube_dir']
+                # Load HOMO on the GUI thread (touches viewer).
                 try:
-                    from pyscf.prop import infrared
-                    ir = infrared.Infrared(mf).kernel()
-                    if hasattr(ir, 'ir_inten'):
-                        ir_ints = [float(x) for x in ir.ir_inten[:len(real_freqs)]]
-                except:
-                    pass
-                self.info['frequencies'] = real_freqs
-                self.info['ir_intensities'] = ir_ints
-                self.log(f"Frequencies: {', '.join(f'{f:.0f}' for f in real_freqs[:6])}{'...' if len(real_freqs)>6 else ''} cm-1")
-            except Exception as ex:
-                self.log(f"Frequency calculation failed: {ex}")
+                    self.load_cube(r['homo_cube'])
+                except Exception as ex:
+                    self.log(f"HOMO cube display failed: {ex}")
+                self.log(f"HOMO/LUMO cubes: {r['cube_dir']}")
 
-        # Cube files
-        if cube:
-            self.log("Generating orbital cube files...")
-            try:
-                from pyscf.tools import cubegen
-                import tempfile
-                td = tempfile.mkdtemp(prefix="chemlab_")
-                homo_path = os.path.join(td, "homo.cube")
-                lumo_path = os.path.join(td, "lumo.cube")
-                cubegen.orbital(mol, homo_path, mf.mo_coeff[:,n_occ-1], nx=cube_nx, ny=cube_nx, nz=cube_nx)
-                cubegen.orbital(mol, lumo_path, mf.mo_coeff[:,n_occ], nx=cube_nx, ny=cube_nx, nz=cube_nx)
-                self.info['homo_cube'] = homo_path
-                self.info['lumo_cube'] = lumo_path
-                self.info['cube_dir'] = td
-                # Auto-load HOMO
-                self.load_cube(homo_path)
-                self.log(f"HOMO/LUMO cubes: {td}")
-            except Exception as ex:
-                self.log(f"Cube generation failed: {ex}")
-
+        self._async('calculate', _work, _apply)
         return self
 
     def show_homo(self, isovalue=0.02):
-        """Show HOMO isosurface (requires calculate(cube=True) first, or generates on the fly)."""
+        """Show HOMO isosurface. Generates the cube asynchronously if needed."""
         if 'homo_cube' in self.info:
             self.load_cube(self.info['homo_cube'], isovalue)
-        elif hasattr(self, '_pyscf_mf'):
-            self.log("Generating HOMO cube...")
-            from pyscf.tools import cubegen
-            import tempfile
-            td = tempfile.mkdtemp(prefix="chemlab_")
-            path = os.path.join(td, "homo.cube")
-            n_occ = self.info.get('n_occ', self._pyscf_mol.nelectron//2)
-            cubegen.orbital(self._pyscf_mol, path, self._pyscf_mf.mo_coeff[:,n_occ-1], nx=50, ny=50, nz=50)
-            self.info['homo_cube'] = path
-            self.load_cube(path, isovalue)
-        else:
-            self.log("Run chem.calculate() first")
-        return self
+            return self
+        return self._needs_calc('show_homo',
+            lambda: self._async_orbital_cube('HOMO', self.info.get('n_occ',
+                self._pyscf_mol.nelectron // 2) - 1, isovalue, cache_key='homo_cube'))
 
     def show_lumo(self, isovalue=0.02):
-        """Show LUMO isosurface."""
+        """Show LUMO isosurface. Generates the cube asynchronously if needed."""
         if 'lumo_cube' in self.info:
             self.load_cube(self.info['lumo_cube'], isovalue)
-        elif hasattr(self, '_pyscf_mf'):
-            self.log("Generating LUMO cube...")
-            from pyscf.tools import cubegen
-            import tempfile
-            td = tempfile.mkdtemp(prefix="chemlab_")
-            path = os.path.join(td, "lumo.cube")
-            n_occ = self.info.get('n_occ', self._pyscf_mol.nelectron//2)
-            cubegen.orbital(self._pyscf_mol, path, self._pyscf_mf.mo_coeff[:,n_occ], nx=50, ny=50, nz=50)
-            self.info['lumo_cube'] = path
-            self.load_cube(path, isovalue)
-        else:
-            self.log("Run chem.calculate() first")
-        return self
+            return self
+        return self._needs_calc('show_lumo',
+            lambda: self._async_orbital_cube('LUMO', self.info.get('n_occ',
+                self._pyscf_mol.nelectron // 2), isovalue, cache_key='lumo_cube'))
 
     def show_orbital(self, n, isovalue=0.02):
-        """Show any MO by index (0-based). Generates cube on the fly."""
-        if not hasattr(self, '_pyscf_mf'):
-            self.log("Run chem.calculate() first"); return self
-        from pyscf.tools import cubegen
-        import tempfile
-        td = tempfile.mkdtemp(prefix="chemlab_")
-        path = os.path.join(td, f"mo_{n}.cube")
-        cubegen.orbital(self._pyscf_mol, path, self._pyscf_mf.mo_coeff[:,n], nx=50, ny=50, nz=50)
-        self.load_cube(path, isovalue)
-        n_occ = self.info.get('n_occ', 0)
-        label = "HOMO" if n == n_occ-1 else "LUMO" if n == n_occ else f"MO {n}"
-        eV = self.info.get('mo_energies', [None]*(n+1))[n]
-        self.log(f"Showing {label} (MO {n}): {eV:.3f} eV" if eV else f"Showing MO {n}")
+        """Show any MO by index (0-based). Cube generated asynchronously."""
+        return self._needs_calc('show_orbital',
+            lambda: self._async_orbital_cube(f'MO {n}', n, isovalue))
+
+    def _async_orbital_cube(self, label, mo_idx, isovalue, cache_key=None):
+        """Generate one MO cube on a worker thread, then display it on
+        the GUI thread. Used by show_homo/show_lumo/show_orbital."""
+        mol = self._pyscf_mol
+        mo_coeff = self._pyscf_mf.mo_coeff[:, mo_idx]
+        n_occ = self.info.get('n_occ', mol.nelectron // 2)
+        mo_energies = self.info.get('mo_energies', [])
+        eV = mo_energies[mo_idx] if 0 <= mo_idx < len(mo_energies) else None
+
+        def _work():
+            from pyscf.tools import cubegen
+            import tempfile
+            td = tempfile.mkdtemp(prefix="chemlab_mo_")
+            path = os.path.join(td, f"mo_{mo_idx}.cube")
+            cubegen.orbital(mol, path, mo_coeff, nx=50, ny=50, nz=50)
+            return path
+
+        def _apply(path):
+            if cache_key:
+                self.info[cache_key] = path
+            self.load_cube(path, isovalue)
+            pretty = ("HOMO" if mo_idx == n_occ - 1 else
+                      "LUMO" if mo_idx == n_occ else f"MO {mo_idx}")
+            if eV is not None:
+                self.log(f"Showing {pretty} (MO {mo_idx}): {eV:.3f} eV")
+            else:
+                self.log(f"Showing {pretty}")
+
+        self._async(label, _work, _apply)
         return self
 
     # ── Analysis helpers ───────────────────────────────────────
@@ -1786,33 +2411,61 @@ class ChemLab:
     # ── 7.1: Electrostatic Potential mapped onto density ──────
 
     def show_esp(self, density_iso=0.05, vmin=None, vmax=None):
-        """Render ESP color-mapped onto the electron density isosurface.
-        Requires calculate(cube=True, esp=True) or externally loaded cubes.
-        Like VMD's 'Volume' coloring method from section 7.1."""
+        """Render ESP color-mapped onto the electron density isosurface (async).
+        Requires calculate(cube=True, esp=True) or externally loaded cubes."""
         dens = self.info.get('_density_cube')
         esp = self.info.get('_esp_cube')
         if dens is None or esp is None:
-            self.log("Need density + ESP cubes. Run calculate(cube=True, esp=True) or load_esp()")
+            self.log("Need density + ESP cubes. Run calculate_full() or load_esp()")
             return self
-        self.viewer.set_colormapped_surface(dens, esp, density_iso, vmin, vmax)
-        self.log(f"ESP mapped onto density (iso={density_iso})")
+
+        def _work():
+            return cube_colormapped_isosurface(dens, esp, density_iso, vmin, vmax)
+
+        def _apply(verts):
+            if not verts:
+                self.log("ESP isosurface produced no triangles")
+                return
+            cx, cy, cz = self.viewer._center
+            arr = np.array(verts, dtype=np.float32).reshape(-1, 9)
+            if cx or cy or cz:
+                arr[:, 0] -= cx; arr[:, 1] -= cy; arr[:, 2] -= cz
+            self.viewer.set_orbital_mesh(arr.ravel().tolist())
+            self.log(f"ESP mapped onto density (iso={density_iso})")
+
+        self._async('show_esp', _work, _apply)
         return self
 
     def load_esp(self, density_path, esp_path, density_iso=0.05):
-        """Load external density and ESP cube files and display ESP-mapped surface.
-        Equivalent to h2o-dens.cube + h2o-pot.cube from the tutorial."""
-        dens_path = os.path.expanduser(density_path)
-        esp_path_exp = os.path.expanduser(esp_path)
-        with open(dens_path) as f: dens = parse_cube(f.read())
-        with open(esp_path_exp) as f: esp = parse_cube(f.read())
-        if not dens or not esp:
-            self.log("Failed to parse cube files"); return self
-        self.info['_density_cube'] = dens
-        self.info['_esp_cube'] = esp
-        self.atoms = dens['atoms']; self.bonds = detect_bonds(self.atoms)
-        self.viewer.set_molecule(self.atoms, "ESP map")
-        self.viewer.set_colormapped_surface(dens, esp, density_iso)
-        self.log(f"ESP mapped onto density surface")
+        """Load external density and ESP cube files and display ESP-mapped surface (async)."""
+        dens_p = os.path.expanduser(density_path)
+        esp_p = os.path.expanduser(esp_path)
+
+        def _work():
+            with open(dens_p) as f:
+                dens = parse_cube(f.read())
+            with open(esp_p) as f:
+                esp = parse_cube(f.read())
+            if not dens or not esp:
+                raise RuntimeError("Failed to parse cube files")
+            verts = cube_colormapped_isosurface(dens, esp, density_iso)
+            return {'dens': dens, 'esp': esp, 'verts': verts}
+
+        def _apply(r):
+            self.info['_density_cube'] = r['dens']
+            self.info['_esp_cube'] = r['esp']
+            self.atoms = r['dens']['atoms']; self.bonds = detect_bonds(self.atoms)
+            self.viewer.set_molecule(self.atoms, "ESP map")
+            verts = r['verts']
+            if verts:
+                cx, cy, cz = self.viewer._center
+                arr = np.array(verts, dtype=np.float32).reshape(-1, 9)
+                if cx or cy or cz:
+                    arr[:, 0] -= cx; arr[:, 1] -= cy; arr[:, 2] -= cz
+                self.viewer.set_orbital_mesh(arr.ravel().tolist())
+            self.log("ESP mapped onto density surface")
+
+        self._async('load_esp', _work, _apply)
         return self
 
     def show_volume_slice(self, axis=1, pos=0.5, source='esp'):
@@ -1843,134 +2496,148 @@ class ChemLab:
     # ── 7.2: Localized (Wannier) orbitals ────────────────────
 
     def show_localized_orbitals(self, isovalue=0.02):
-        """Compute and display localized (Boys/Pipek-Mezey) orbitals using PySCF.
-        Renders all occupied localized orbitals as stacked isosurfaces."""
-        if not hasattr(self, '_pyscf_mf'):
-            self.log("Run chem.calculate() first"); return self
-        try:
-            from pyscf import lo
-            from pyscf.tools import cubegen
-            import tempfile
-        except ImportError:
-            self.log("PySCF localization module not available"); return self
-        mol = self._pyscf_mol; mf = self._pyscf_mf
-        n_occ = self.info.get('n_occ', mol.nelectron//2)
-        occ_coeffs = mf.mo_coeff[:, :n_occ]
-        self.log(f"Localizing {n_occ} occupied orbitals (Boys)...")
-        loc_orb = lo.Boys(mol, occ_coeffs).kernel()
-        td = tempfile.mkdtemp(prefix="chemlab_loc_")
-        self.viewer.clear_iso_layers()
-        colors = [(0x3070CC, 0xCC3030), (0x30CC70, 0xCC7030), (0x7030CC, 0x30CCCC), (0xCC30CC, 0x70CC30)]
-        all_verts = []
-        for i in range(n_occ):
-            path = os.path.join(td, f"loc_{i}.cube")
-            cubegen.orbital(mol, path, loc_orb[:, i], nx=40, ny=40, nz=40)
-            with open(path) as f: cube = parse_cube(f.read())
-            if cube is None: continue
-            col_p, col_n = colors[i % len(colors)]
-            g, o, ax, n = cube['grid'], cube['origin'], cube['axes'], cube['npts']
-            pos_raw = _marching_cubes(g, o, ax, n, isovalue)
-            neg_raw = _marching_cubes(g, o, ax, n, -isovalue)
-            rp, gp, bp = _hex(col_p); rn, gn, bn = _hex(col_n)
-            verts = []
-            for vi in range(0, len(pos_raw), 6):
-                verts.extend(pos_raw[vi:vi+6]); verts.extend((rp, gp, bp))
-            for vi in range(0, len(neg_raw), 6):
-                verts.extend(neg_raw[vi:vi+6]); verts.extend((rn, gn, bn))
-            if verts:
-                cx, cy, cz = self.viewer._center
-                arr = np.array(verts, dtype=np.float32).reshape(-1, 9)
-                arr[:,0] -= cx; arr[:,1] -= cy; arr[:,2] -= cz
-                self.viewer.add_iso_layer(arr.flatten().tolist(), 0.45, f"loc_{i}")
-            self.info[f'loc_orb_{i}_cube'] = path
-        self.log(f"Showing {n_occ} localized orbitals")
-        return self
+        """Compute and display localized (Boys) orbitals using PySCF.
+        Heavy compute runs on a worker; GL uploads stay on the GUI thread."""
+        def _kickoff():
+            try:
+                from pyscf import lo  # noqa: F401
+                from pyscf.tools import cubegen  # noqa: F401
+            except ImportError:
+                self.log("PySCF localization module not available"); return
+            mol = self._pyscf_mol; mf = self._pyscf_mf
+            n_occ = self.info.get('n_occ', mol.nelectron // 2)
+            occ_coeffs = mf.mo_coeff[:, :n_occ]
+            self.log(f"Localizing {n_occ} occupied orbitals (Boys)...")
+            colors = [(0x3070CC, 0xCC3030), (0x30CC70, 0xCC7030),
+                      (0x7030CC, 0x30CCCC), (0xCC30CC, 0x70CC30)]
+
+            def _work():
+                from pyscf import lo as _lo
+                from pyscf.tools import cubegen as _cubegen
+                import tempfile
+                loc_orb = _lo.Boys(mol, occ_coeffs).kernel()
+                td = tempfile.mkdtemp(prefix="chemlab_loc_")
+                layers = []  # (verts_array, opacity, label, cube_path)
+                for i in range(n_occ):
+                    path = os.path.join(td, f"loc_{i}.cube")
+                    _cubegen.orbital(mol, path, loc_orb[:, i], nx=40, ny=40, nz=40)
+                    with open(path) as f:
+                        cube = parse_cube(f.read())
+                    if cube is None:
+                        continue
+                    col_p, col_n = colors[i % len(colors)]
+                    g, o, ax, n = cube['grid'], cube['origin'], cube['axes'], cube['npts']
+                    pos_arr = _verts_to_array(_marching_cubes(g, o, ax, n, isovalue), _hex(col_p))
+                    neg_arr = _verts_to_array(_marching_cubes(g, o, ax, n, -isovalue), _hex(col_n))
+                    if pos_arr.shape[0] == 0 and neg_arr.shape[0] == 0:
+                        continue
+                    arr = np.concatenate([pos_arr, neg_arr], axis=0)
+                    layers.append((arr, 0.45, f"loc_{i}", path))
+                return layers
+
+            def _apply(layers):
+                self.viewer.clear_iso_layers()
+                center = self.viewer._center
+                count = 0
+                for arr, opacity, label, path in layers:
+                    centered = _center_verts_array(arr, center)
+                    self.viewer.add_iso_layer(centered.ravel().tolist(), opacity, label)
+                    self.info[f'{label}_cube'] = path
+                    count += 1
+                self.log(f"Showing {count} localized orbitals")
+
+            self._async('localized_orbitals', _work, _apply)
+
+        return self._needs_calc('show_localized_orbitals', _kickoff)
 
     # ── 7.3: Electron Localization Function (ELF) ────────────
 
     def show_elf(self, isovalue=0.85):
         """Compute and display the Electron Localization Function.
-        ELF describes chemical bonding topologically — attractors
-        correspond to bonds, lone pairs, and atomic shells."""
-        if not hasattr(self, '_pyscf_mf'):
-            self.log("Run chem.calculate() first"); return self
-        try:
-            from pyscf import dft as pyscf_dft
-            from pyscf.tools import cubegen
-            import tempfile
-        except ImportError:
-            self.log("PySCF not available"); return self
-        mol = self._pyscf_mol; mf = self._pyscf_mf
-        self.log("Computing ELF...")
-        # Compute electron density and kinetic energy density on a grid
-        td = tempfile.mkdtemp(prefix="chemlab_elf_")
-        nx = 50
-        # Generate density cube for the grid
-        n_occ = self.info.get('n_occ', mol.nelectron // 2)
-        dens_path = os.path.join(td, "density.cube")
-        cubegen.density(mol, dens_path, mf.make_rdm1(), nx=nx, ny=nx, nz=nx)
-        with open(dens_path) as f: dens_cube = parse_cube(f.read())
-        if dens_cube is None:
-            self.log("Failed to generate density cube"); return self
-        # Compute ELF on the same grid via orbital evaluation
-        g = dens_cube['grid']; o = dens_cube['origin']
-        ax_arr = dens_cube['axes']; npts = dens_cube['npts']
-        n1, n2, n3 = npts
-        # Build real-space grid coords
-        coords = np.zeros((n1*n2*n3, 3))
-        idx = 0
-        for i in range(n1):
-            for j in range(n2):
-                for k in range(n3):
-                    coords[idx] = (o + np.array(ax_arr[0])*i + np.array(ax_arr[1])*j + np.array(ax_arr[2])*k) / BOHR
-                    idx += 1
-        # Evaluate orbitals and their gradients
-        from pyscf.dft import numint
-        ao = numint.eval_ao(mol, coords, deriv=1)  # (4, ngrids, nao) — value, dx, dy, dz
-        mo_coeff = mf.mo_coeff[:, :n_occ]
-        mo_val = ao[0] @ mo_coeff       # (ngrids, n_occ)
-        mo_dx  = ao[1] @ mo_coeff
-        mo_dy  = ao[2] @ mo_coeff
-        mo_dz  = ao[3] @ mo_coeff
-        # Kinetic energy density τ = 0.5 Σ |∇ψ_i|²
-        tau = 0.5 * np.sum(mo_dx**2 + mo_dy**2 + mo_dz**2, axis=1)
-        # Electron density ρ = 2 Σ |ψ_i|² (factor 2 for closed shell)
-        rho = 2.0 * np.sum(mo_val**2, axis=1)
-        rho = np.maximum(rho, 1e-30)
-        # Thomas-Fermi kinetic energy density
-        cf = (3.0/10.0) * (3.0 * np.pi**2)**(2.0/3.0)
-        tau_tf = cf * rho**(5.0/3.0)
-        # von Weizsäcker kinetic energy density
-        grad_rho_sq = (2.0 * np.sum(mo_val * mo_dx, axis=1))**2 + \
-                      (2.0 * np.sum(mo_val * mo_dy, axis=1))**2 + \
-                      (2.0 * np.sum(mo_val * mo_dz, axis=1))**2
-        tau_w = grad_rho_sq / (8.0 * rho)
-        # ELF = 1 / (1 + (D/D0)²) where D = τ - τ_W, D0 = τ_TF
-        D = np.maximum(tau - tau_w, 0.0)
-        D0 = np.maximum(tau_tf, 1e-30)
-        chi = D / D0
-        elf_vals = 1.0 / (1.0 + chi**2)
-        elf_grid = elf_vals.reshape(n1, n2, n3)
-        elf_cube = {**dens_cube, 'grid': elf_grid}
-        self.info['_elf_cube'] = elf_cube
-        self.info['_density_cube'] = dens_cube
-        # Save ELF cube file
-        elf_path = os.path.join(td, "elf.cube")
-        cube_write(elf_cube, elf_path)
-        self.info['elf_cube'] = elf_path
-        # Display: ELF isosurface with a green-yellow palette
-        verts = _marching_cubes(elf_grid, o, ax_arr, npts, isovalue)
-        rg, gg, bg = _hex(0x40C060)
-        result = []
-        for vi in range(0, len(verts), 6):
-            result.extend(verts[vi:vi+6]); result.extend((rg, gg, bg))
-        if result:
-            cx, cy, cz = self.viewer._center
-            arr = np.array(result, dtype=np.float32).reshape(-1, 9)
-            arr[:,0] -= cx; arr[:,1] -= cy; arr[:,2] -= cz
-            self.viewer.set_orbital_mesh(arr.flatten().tolist())
-        self.log(f"ELF computed (isovalue={isovalue})")
-        return self
+        Heavy compute runs on a worker thread; vectorized grid build."""
+        def _kickoff():
+            try:
+                from pyscf.tools import cubegen  # noqa: F401
+                from pyscf.dft import numint  # noqa: F401
+            except ImportError:
+                self.log("PySCF not available"); return
+            mol = self._pyscf_mol; mf = self._pyscf_mf
+            n_occ = self.info.get('n_occ', mol.nelectron // 2)
+            self.log("Computing ELF...")
+
+            def _work():
+                from pyscf.tools import cubegen as _cubegen
+                from pyscf.dft import numint as _numint
+                import tempfile
+                td = tempfile.mkdtemp(prefix="chemlab_elf_")
+                nx = 50
+                dens_path = os.path.join(td, "density.cube")
+                _cubegen.density(mol, dens_path, mf.make_rdm1(), nx=nx, ny=nx, nz=nx)
+                with open(dens_path) as f:
+                    dens_cube = parse_cube(f.read())
+                if dens_cube is None:
+                    raise RuntimeError("Failed to generate density cube")
+                o = dens_cube['origin']
+                ax_arr = [np.asarray(a, dtype=np.float64) for a in dens_cube['axes']]
+                npts = dens_cube['npts']
+                n1, n2, n3 = npts
+                # Vectorized grid coord build (was a triple Python loop).
+                ii = np.arange(n1, dtype=np.float64)
+                jj = np.arange(n2, dtype=np.float64)
+                kk = np.arange(n3, dtype=np.float64)
+                I, J, K = np.meshgrid(ii, jj, kk, indexing='ij')
+                coords = (o[None, None, None, :]
+                          + I[..., None] * ax_arr[0][None, None, None, :]
+                          + J[..., None] * ax_arr[1][None, None, None, :]
+                          + K[..., None] * ax_arr[2][None, None, None, :])
+                coords = coords.reshape(-1, 3) / BOHR
+                # Orbital evaluation + ELF computation.
+                ao = _numint.eval_ao(mol, coords, deriv=1)
+                mo_coeff = mf.mo_coeff[:, :n_occ]
+                mo_val = ao[0] @ mo_coeff
+                mo_dx = ao[1] @ mo_coeff
+                mo_dy = ao[2] @ mo_coeff
+                mo_dz = ao[3] @ mo_coeff
+                tau = 0.5 * np.sum(mo_dx**2 + mo_dy**2 + mo_dz**2, axis=1)
+                rho = 2.0 * np.sum(mo_val**2, axis=1)
+                rho = np.maximum(rho, 1e-30)
+                cf = (3.0/10.0) * (3.0 * np.pi**2)**(2.0/3.0)
+                tau_tf = cf * rho**(5.0/3.0)
+                grad_rho_sq = ((2.0 * np.sum(mo_val * mo_dx, axis=1))**2 +
+                               (2.0 * np.sum(mo_val * mo_dy, axis=1))**2 +
+                               (2.0 * np.sum(mo_val * mo_dz, axis=1))**2)
+                tau_w = grad_rho_sq / (8.0 * rho)
+                D = np.maximum(tau - tau_w, 0.0)
+                D0 = np.maximum(tau_tf, 1e-30)
+                chi = D / D0
+                elf_vals = 1.0 / (1.0 + chi**2)
+                elf_grid = elf_vals.reshape(n1, n2, n3)
+                elf_cube = {**dens_cube, 'grid': elf_grid}
+                elf_path = os.path.join(td, "elf.cube")
+                cube_write(elf_cube, elf_path)
+                # Marching cubes here (already vectorized).
+                raw = _marching_cubes(elf_grid, o, ax_arr, npts, isovalue)
+                verts = _verts_to_array(raw, _hex(0x40C060))
+                return {
+                    'dens_cube': dens_cube,
+                    'elf_cube': elf_cube,
+                    'elf_path': elf_path,
+                    'verts': verts,
+                }
+
+            def _apply(r):
+                self.info['_elf_cube'] = r['elf_cube']
+                self.info['_density_cube'] = r['dens_cube']
+                self.info['elf_cube'] = r['elf_path']
+                verts = r['verts']
+                if verts.shape[0]:
+                    centered = _center_verts_array(verts, self.viewer._center)
+                    self.viewer.set_orbital_mesh(centered.ravel().tolist())
+                self.log(f"ELF computed (isovalue={isovalue})")
+
+            self._async('show_elf', _work, _apply)
+
+        return self._needs_calc('show_elf', _kickoff)
 
     def load_elf(self, path, isovalue=0.85):
         """Load a pre-computed ELF cube file."""
@@ -1981,52 +2648,54 @@ class ChemLab:
         self.info['_elf_cube'] = cube
         self.atoms = cube['atoms']; self.bonds = detect_bonds(self.atoms)
         self.viewer.set_molecule(self.atoms, "ELF")
-        verts = _marching_cubes(cube['grid'], cube['origin'], cube['axes'], cube['npts'], isovalue)
-        rg, gg, bg = _hex(0x40C060)
-        result = []
-        for vi in range(0, len(verts), 6):
-            result.extend(verts[vi:vi+6]); result.extend((rg, gg, bg))
-        if result:
-            cx, cy, cz = self.viewer._center
-            arr = np.array(result, dtype=np.float32).reshape(-1, 9)
-            arr[:,0] -= cx; arr[:,1] -= cy; arr[:,2] -= cz
-            self.viewer.set_orbital_mesh(arr.flatten().tolist())
+        raw = _marching_cubes(cube['grid'], cube['origin'], cube['axes'], cube['npts'], isovalue)
+        arr = _verts_to_array(raw, _hex(0x40C060))
+        if arr.shape[0]:
+            centered = _center_verts_array(arr, self.viewer._center)
+            self.viewer.set_orbital_mesh(centered.ravel().tolist())
         self.log(f"Loaded ELF: {path}")
         return self
 
     # ── 7.4: Density difference (response to perturbation) ───
 
     def density_difference(self, cube_a, cube_b, isovalue=0.002):
-        """Display the difference A - B of two density cube files/dicts.
-        Shows areas of increased (yellow) and decreased (green) electron density.
-        Like the cubman 'subtract' workflow from section 7.4."""
-        if isinstance(cube_a, str):
-            with open(os.path.expanduser(cube_a)) as f: cube_a = parse_cube(f.read())
-        if isinstance(cube_b, str):
-            with open(os.path.expanduser(cube_b)) as f: cube_b = parse_cube(f.read())
-        if not cube_a or not cube_b:
-            self.log("Failed to parse cube files"); return self
-        diff = cube_subtract(cube_a, cube_b)
-        self.info['_diff_cube'] = diff
-        self.atoms = diff['atoms']; self.bonds = detect_bonds(self.atoms)
-        self.viewer.set_molecule(self.atoms, "Density difference")
-        g, o, ax, n = diff['grid'], diff['origin'], diff['axes'], diff['npts']
-        # Positive = increased density (yellow), negative = decreased (green)
-        pos_raw = _marching_cubes(g, o, ax, n, isovalue)
-        neg_raw = _marching_cubes(g, o, ax, n, -isovalue)
-        rp, gp, bp = _hex(0xDDCC30)  # yellow
-        rn, gn, bn = _hex(0x30CC70)  # green
-        result = []
-        for vi in range(0, len(pos_raw), 6):
-            result.extend(pos_raw[vi:vi+6]); result.extend((rp, gp, bp))
-        for vi in range(0, len(neg_raw), 6):
-            result.extend(neg_raw[vi:vi+6]); result.extend((rn, gn, bn))
-        if result:
-            cx, cy, cz = self.viewer._center
-            arr = np.array(result, dtype=np.float32).reshape(-1, 9)
-            arr[:,0] -= cx; arr[:,1] -= cy; arr[:,2] -= cz
-            self.viewer.set_orbital_mesh(arr.flatten().tolist())
-        self.log(f"Density difference (iso=±{isovalue})")
+        """Display the difference A - B of two density cubes (async)."""
+        path_a = cube_a if isinstance(cube_a, str) else None
+        path_b = cube_b if isinstance(cube_b, str) else None
+        dict_a = cube_a if isinstance(cube_a, dict) else None
+        dict_b = cube_b if isinstance(cube_b, dict) else None
+
+        def _work():
+            ca = dict_a
+            cb = dict_b
+            if path_a is not None:
+                with open(os.path.expanduser(path_a)) as f:
+                    ca = parse_cube(f.read())
+            if path_b is not None:
+                with open(os.path.expanduser(path_b)) as f:
+                    cb = parse_cube(f.read())
+            if not ca or not cb:
+                raise RuntimeError("Failed to parse cube files")
+            diff = cube_subtract(ca, cb)
+            g, o, ax, n = diff['grid'], diff['origin'], diff['axes'], diff['npts']
+            pos_arr = _verts_to_array(_marching_cubes(g, o, ax, n, isovalue), _hex(0xDDCC30))
+            neg_arr = _verts_to_array(_marching_cubes(g, o, ax, n, -isovalue), _hex(0x30CC70))
+            merged = np.concatenate([pos_arr, neg_arr], axis=0) if (
+                pos_arr.shape[0] or neg_arr.shape[0]) else np.zeros((0, 9), dtype=np.float32)
+            return {'diff': diff, 'verts': merged}
+
+        def _apply(r):
+            diff = r['diff']
+            self.info['_diff_cube'] = diff
+            self.atoms = diff['atoms']; self.bonds = detect_bonds(self.atoms)
+            self.viewer.set_molecule(self.atoms, "Density difference")
+            verts = r['verts']
+            if verts.shape[0]:
+                centered = _center_verts_array(verts, self.viewer._center)
+                self.viewer.set_orbital_mesh(centered.ravel().tolist())
+            self.log(f"Density difference (iso=±{isovalue})")
+
+        self._async('density_difference', _work, _apply)
         return self
 
     def cube_math(self, op, cube_a, cube_b=None, scale=1.0):
@@ -2070,59 +2739,75 @@ class ChemLab:
         return self
 
     def show_bulk_esp(self, density_iso=0.05, esp_isovals=None):
-        """Display bulk system with multiple ESP isosurfaces at different values.
-        esp_isovals: list of (value, color_hex) pairs. Default: blue/red/pink."""
+        """Display bulk system with multiple ESP isosurfaces (async).
+        esp_isovals: list of (value, color_hex) pairs."""
         dens = self.info.get('_density_cube')
         esp = self.info.get('_esp_cube')
         if not dens:
             self.log("Load bulk system first"); return self
-        self.viewer.clear_iso_layers()
         if esp_isovals is None:
             esp_isovals = [(-0.02, 0x3060CC), (0.02, 0xCC3030), (0.05, 0xDD80AA)]
-        if esp:
-            cx, cy, cz = self.viewer._center
-            for val, col in esp_isovals:
-                rp, gp, bp = _hex(col)
-                raw = _marching_cubes(esp['grid'], esp['origin'], esp['axes'], esp['npts'], val)
-                verts = []
-                for vi in range(0, len(raw), 6):
-                    verts.extend(raw[vi:vi+6]); verts.extend((rp, gp, bp))
-                if verts:
-                    arr = np.array(verts, dtype=np.float32).reshape(-1, 9)
-                    arr[:,0] -= cx; arr[:,1] -= cy; arr[:,2] -= cz
-                    self.viewer.add_iso_layer(arr.flatten().tolist(), 0.4, f"ESP_{val}")
-        # Density surface (green, semi-transparent)
-        rg, gg, bg = _hex(0x40CC60)
-        raw = _marching_cubes(dens['grid'], dens['origin'], dens['axes'], dens['npts'], density_iso)
-        verts = []
-        for vi in range(0, len(raw), 6):
-            verts.extend(raw[vi:vi+6]); verts.extend((rg, gg, bg))
-        if verts:
-            arr = np.array(verts, dtype=np.float32).reshape(-1, 9)
-            arr[:,0] -= cx; arr[:,1] -= cy; arr[:,2] -= cz
-            self.viewer.add_iso_layer(arr.flatten().tolist(), 0.25, "density")
-        self.log(f"Bulk ESP display: {len(esp_isovals)} ESP layers + density")
+
+        def _work():
+            layers = []  # (verts_array, opacity, label)
+            if esp:
+                for val, col in esp_isovals:
+                    raw = _marching_cubes(esp['grid'], esp['origin'], esp['axes'], esp['npts'], val)
+                    arr = _verts_to_array(raw, _hex(col))
+                    if arr.shape[0]:
+                        layers.append((arr, 0.4, f"ESP_{val}"))
+            raw = _marching_cubes(dens['grid'], dens['origin'], dens['axes'],
+                                  dens['npts'], density_iso)
+            arr = _verts_to_array(raw, _hex(0x40CC60))
+            if arr.shape[0]:
+                layers.append((arr, 0.25, "density"))
+            return layers
+
+        def _apply(layers):
+            self.viewer.clear_iso_layers()
+            center = self.viewer._center
+            for arr, opacity, label in layers:
+                centered = _center_verts_array(arr, center)
+                self.viewer.add_iso_layer(centered.ravel().tolist(), opacity, label)
+            self.log(f"Bulk ESP display: {len(esp_isovals)} ESP layers + density")
+
+        self._async('show_bulk_esp', _work, _apply)
         return self
 
     # ── 7.6: Animated isosurfaces (trajectory) ───────────────
 
     def load_animation(self, cube_paths, isovalue=0.02):
-        """Load a sequence of cube files for animated isosurface playback.
+        """Load a sequence of cube files for animated isosurface playback (async).
         cube_paths: list of file paths, or a glob pattern string."""
         if isinstance(cube_paths, str):
             import glob
-            cube_paths = sorted(glob.glob(os.path.expanduser(cube_paths)))
-        cubes = []
-        for p in cube_paths:
-            with open(p) as f: c = parse_cube(f.read())
-            if c: cubes.append(c)
-        if not cubes:
-            self.log("No valid cube files found"); return self
-        # Use first frame's atoms for the molecule display
-        self.atoms = cubes[0]['atoms']; self.bonds = detect_bonds(self.atoms)
-        self.viewer.set_molecule(self.atoms, f"Animation ({len(cubes)} frames)")
-        self.viewer.set_animation_cubes(cubes, isovalue)
-        self.log(f"Loaded animation: {len(cubes)} frames")
+            paths = sorted(glob.glob(os.path.expanduser(cube_paths)))
+        else:
+            paths = list(cube_paths)
+        if not paths:
+            self.log("No cube files matched"); return self
+
+        def _work():
+            cubes = []
+            for p in paths:
+                try:
+                    with open(p) as f:
+                        c = parse_cube(f.read())
+                    if c:
+                        cubes.append(c)
+                except Exception:
+                    pass
+            return cubes
+
+        def _apply(cubes):
+            if not cubes:
+                self.log("No valid cube files found"); return
+            self.atoms = cubes[0]['atoms']; self.bonds = detect_bonds(self.atoms)
+            self.viewer.set_molecule(self.atoms, f"Animation ({len(cubes)} frames)")
+            self.viewer.set_animation_cubes(cubes, isovalue)
+            self.log(f"Loaded animation: {len(cubes)} frames")
+
+        self._async('load_animation', _work, _apply)
         return self
 
     def play(self, interval_ms=200):
@@ -2146,54 +2831,51 @@ class ChemLab:
     # ── 7.7 extended: Spin density ───────────────────────────
 
     def show_spin_density(self, isovalue=0.005):
-        """Compute and display alpha-beta spin density difference.
-        Requires an open-shell calculation (mult > 1).
-        Shows where unpaired electrons are localized (section 7.7)."""
-        if not hasattr(self, '_pyscf_mf'):
-            self.log("Run chem.calculate() first"); return self
-        mf = self._pyscf_mf; mol = self._pyscf_mol
-        try:
-            from pyscf.tools import cubegen
-            import tempfile
-        except ImportError:
-            self.log("PySCF not available"); return self
-        # Check if UHF/UKS
-        dm = mf.make_rdm1()
-        if isinstance(dm, np.ndarray) and dm.ndim == 3 and dm.shape[0] == 2:
-            # dm[0] = alpha, dm[1] = beta
-            spin_dm = dm[0] - dm[1]
-        elif hasattr(mf, 'nelec') and hasattr(mf.nelec, '__len__'):
-            # UHF/UKS with separate alpha/beta
-            spin_dm = dm[0] - dm[1]
-        else:
-            self.log("Spin density requires open-shell (UHF/UKS). Use mult > 1")
-            return self
-        td = tempfile.mkdtemp(prefix="chemlab_spin_")
-        path = os.path.join(td, "spin_density.cube")
-        cubegen.density(mol, path, spin_dm, nx=50, ny=50, nz=50)
-        with open(path) as f: cube = parse_cube(f.read())
-        if cube is None:
-            self.log("Failed to generate spin density cube"); return self
-        self.info['_spin_cube'] = cube
-        self.info['spin_density_cube'] = path
-        g, o, ax, n = cube['grid'], cube['origin'], cube['axes'], cube['npts']
-        # Alpha excess (blue), beta excess (red)
-        pos_raw = _marching_cubes(g, o, ax, n, isovalue)
-        neg_raw = _marching_cubes(g, o, ax, n, -isovalue)
-        rp, gp, bp = _hex(0x3060CC)  # alpha = blue
-        rn, gn, bn = _hex(0xCC3030)  # beta = red
-        result = []
-        for vi in range(0, len(pos_raw), 6):
-            result.extend(pos_raw[vi:vi+6]); result.extend((rp, gp, bp))
-        for vi in range(0, len(neg_raw), 6):
-            result.extend(neg_raw[vi:vi+6]); result.extend((rn, gn, bn))
-        if result:
-            cx, cy, cz = self.viewer._center
-            arr = np.array(result, dtype=np.float32).reshape(-1, 9)
-            arr[:,0] -= cx; arr[:,1] -= cy; arr[:,2] -= cz
-            self.viewer.set_orbital_mesh(arr.flatten().tolist())
-        self.log(f"Spin density displayed (iso=±{isovalue})")
-        return self
+        """Compute and display alpha-beta spin density (async).
+        Requires an open-shell calculation (mult > 1)."""
+        def _kickoff():
+            try:
+                from pyscf.tools import cubegen  # noqa: F401
+            except ImportError:
+                self.log("PySCF not available"); return
+            mf = self._pyscf_mf; mol = self._pyscf_mol
+            dm = mf.make_rdm1()
+            if isinstance(dm, np.ndarray) and dm.ndim == 3 and dm.shape[0] == 2:
+                spin_dm = dm[0] - dm[1]
+            elif hasattr(mf, 'nelec') and hasattr(mf.nelec, '__len__'):
+                spin_dm = dm[0] - dm[1]
+            else:
+                self.log("Spin density requires open-shell (UHF/UKS). Use mult > 1")
+                return
+
+            def _work():
+                from pyscf.tools import cubegen as _cubegen
+                import tempfile
+                td = tempfile.mkdtemp(prefix="chemlab_spin_")
+                path = os.path.join(td, "spin_density.cube")
+                _cubegen.density(mol, path, spin_dm, nx=50, ny=50, nz=50)
+                with open(path) as f:
+                    cube = parse_cube(f.read())
+                if cube is None:
+                    raise RuntimeError("Failed to generate spin density cube")
+                g, o, ax, n = cube['grid'], cube['origin'], cube['axes'], cube['npts']
+                pos_arr = _verts_to_array(_marching_cubes(g, o, ax, n, isovalue), _hex(0x3060CC))
+                neg_arr = _verts_to_array(_marching_cubes(g, o, ax, n, -isovalue), _hex(0xCC3030))
+                merged = np.concatenate([pos_arr, neg_arr], axis=0) if (
+                    pos_arr.shape[0] or neg_arr.shape[0]) else np.zeros((0, 9), dtype=np.float32)
+                return {'cube': cube, 'path': path, 'verts': merged}
+
+            def _apply(r):
+                self.info['_spin_cube'] = r['cube']
+                self.info['spin_density_cube'] = r['path']
+                if r['verts'].shape[0]:
+                    centered = _center_verts_array(r['verts'], self.viewer._center)
+                    self.viewer.set_orbital_mesh(centered.ravel().tolist())
+                self.log(f"Spin density displayed (iso=±{isovalue})")
+
+            self._async('show_spin_density', _work, _apply)
+
+        return self._needs_calc('show_spin_density', _kickoff)
 
     def load_spin_density(self, alpha_path, beta_path, isovalue=0.005):
         """Load alpha and beta density cubes, display their difference."""
@@ -2202,27 +2884,29 @@ class ChemLab:
     # ── Multi-cube overlay ───────────────────────────────────
 
     def add_isosurface(self, cube_or_path, isovalue=0.02, color=0x3070CC, opacity=0.45, label=""):
-        """Add an additional isosurface layer on top of the current view.
+        """Add an additional isosurface layer on top of the current view (async).
         Multiple calls stack up transparent layers."""
-        if isinstance(cube_or_path, str):
-            with open(os.path.expanduser(cube_or_path)) as f:
-                cube = parse_cube(f.read())
-        else:
-            cube = cube_or_path
-        if not cube:
-            self.log("Failed to parse cube"); return self
-        g, o, ax, n = cube['grid'], cube['origin'], cube['axes'], cube['npts']
-        raw = _marching_cubes(g, o, ax, n, isovalue)
-        rp, gp, bp = _hex(color)
-        verts = []
-        for vi in range(0, len(raw), 6):
-            verts.extend(raw[vi:vi+6]); verts.extend((rp, gp, bp))
-        if verts:
-            cx, cy, cz = self.viewer._center
-            arr = np.array(verts, dtype=np.float32).reshape(-1, 9)
-            arr[:,0] -= cx; arr[:,1] -= cy; arr[:,2] -= cz
-            self.viewer.add_iso_layer(arr.flatten().tolist(), opacity, label)
-        self.log(f"Added isosurface layer: {label or 'unnamed'}")
+        path = cube_or_path if isinstance(cube_or_path, str) else None
+        cube_in = cube_or_path if isinstance(cube_or_path, dict) else None
+
+        def _work():
+            cube = cube_in
+            if path is not None:
+                with open(os.path.expanduser(path)) as f:
+                    cube = parse_cube(f.read())
+            if not cube:
+                raise RuntimeError("Failed to parse cube")
+            g, o, ax, n = cube['grid'], cube['origin'], cube['axes'], cube['npts']
+            raw = _marching_cubes(g, o, ax, n, isovalue)
+            return _verts_to_array(raw, _hex(color))
+
+        def _apply(arr):
+            if arr.shape[0]:
+                centered = _center_verts_array(arr, self.viewer._center)
+                self.viewer.add_iso_layer(centered.ravel().tolist(), opacity, label)
+            self.log(f"Added isosurface layer: {label or 'unnamed'}")
+
+        self._async('add_isosurface', _work, _apply)
         return self
 
     def clear_layers(self):
@@ -2235,7 +2919,8 @@ class ChemLab:
     def calculate_full(self, method="B3LYP", basis="sto-3g", charge=0, mult=1,
                        freq=False, cube=True, esp=True, elf=False, cube_nx=50):
         """Full quantum chemistry calculation with density, ESP, and optionally ELF.
-        This is the all-in-one method that generates everything from section 7.1-7.3.
+        Asynchronous: queues the post-SCF cube work to run once `calculate`
+        finishes, so the UI never blocks.
 
         After calling:
             chem.show_esp()              — ESP mapped onto density
@@ -2243,53 +2928,54 @@ class ChemLab:
             chem.show_homo()             — HOMO isosurface
             chem.show_volume_slice()     — 2D cross-section
         """
-        # Run base calculation with cube generation
         self.calculate(method=method, basis=basis, charge=charge, mult=mult,
-                      freq=freq, cube=cube, cube_nx=cube_nx)
+                       freq=freq, cube=cube, cube_nx=cube_nx)
 
-        if not hasattr(self, '_pyscf_mf'):
-            return self
+        # Post-SCF extras: density cube + ESP cube. These don't strictly
+        # need the SCF result on the GUI thread, but they need _pyscf_mf
+        # available, so we run them through _needs_calc to ensure ordering.
+        def _kickoff_extras():
+            mol = self._pyscf_mol; mf = self._pyscf_mf
+            td = self.info.get('cube_dir')
+            if not td:
+                import tempfile
+                td = tempfile.mkdtemp(prefix="chemlab_full_")
+                self.info['cube_dir'] = td
 
-        mol = self._pyscf_mol; mf = self._pyscf_mf
-        td = self.info.get('cube_dir')
-        if not td:
-            import tempfile
-            td = tempfile.mkdtemp(prefix="chemlab_full_")
-            self.info['cube_dir'] = td
+            if cube or esp:
+                def _work_dens():
+                    from pyscf.tools import cubegen
+                    dens_path = os.path.join(td, "density.cube")
+                    cubegen.density(mol, dens_path, mf.make_rdm1(),
+                                    nx=cube_nx, ny=cube_nx, nz=cube_nx)
+                    with open(dens_path) as f:
+                        dens = parse_cube(f.read())
+                    return {'dens_path': dens_path, 'dens': dens}
+                def _apply_dens(r):
+                    self.info['_density_cube'] = r['dens']
+                    self.info['density_cube'] = r['dens_path']
+                    self.log(f"Density cube: {r['dens_path']}")
+                self._async('density_cube', _work_dens, _apply_dens)
 
-        # Generate density cube
-        if cube or esp:
-            self.log("Generating density cube...")
-            try:
-                from pyscf.tools import cubegen
-                dens_path = os.path.join(td, "density.cube")
-                cubegen.density(mol, dens_path, mf.make_rdm1(), nx=cube_nx, ny=cube_nx, nz=cube_nx)
-                with open(dens_path) as f: dens = parse_cube(f.read())
-                self.info['_density_cube'] = dens
-                self.info['density_cube'] = dens_path
-                self.log(f"Density cube: {dens_path}")
-            except Exception as ex:
-                self.log(f"Density cube failed: {ex}")
+            if esp:
+                def _work_esp():
+                    from pyscf.tools import cubegen
+                    esp_path = os.path.join(td, "esp.cube")
+                    cubegen.mep(mol, esp_path, mf.make_rdm1(),
+                                nx=cube_nx, ny=cube_nx, nz=cube_nx)
+                    with open(esp_path) as f:
+                        esp_cube = parse_cube(f.read())
+                    return {'esp_path': esp_path, 'esp_cube': esp_cube}
+                def _apply_esp(r):
+                    self.info['_esp_cube'] = r['esp_cube']
+                    self.info['esp_cube'] = r['esp_path']
+                    self.log(f"ESP cube: {r['esp_path']}")
+                self._async('esp_cube', _work_esp, _apply_esp)
 
-        # Generate ESP cube
-        if esp:
-            self.log("Computing electrostatic potential...")
-            try:
-                from pyscf.tools import cubegen
-                esp_path = os.path.join(td, "esp.cube")
-                # PySCF ESP on grid
-                cubegen.mep(mol, esp_path, mf.make_rdm1(), nx=cube_nx, ny=cube_nx, nz=cube_nx)
-                with open(esp_path) as f: esp_cube = parse_cube(f.read())
-                self.info['_esp_cube'] = esp_cube
-                self.info['esp_cube'] = esp_path
-                self.log(f"ESP cube: {esp_path}")
-            except Exception as ex:
-                self.log(f"ESP computation failed: {ex}")
+            if elf:
+                self.show_elf()
 
-        # ELF
-        if elf:
-            self.show_elf()
-
+        self._needs_calc('calculate_full extras', _kickoff_extras)
         return self
 
     # ── Cube file I/O helpers ────────────────────────────────
@@ -2518,6 +3204,9 @@ class ChemLabApp(QWidget):
     def _wire_signals(self):
         c = self.chem; v = self.viewer
 
+        # Buttons that fire heavy work — disabled while any task is in flight.
+        self._heavy_buttons = []
+
         # Wrap chem methods to auto-update UI
         _orig_load = c.load
         def _load_wrap(name): _orig_load(name); self._update_ui(); return c
@@ -2538,6 +3227,14 @@ class ChemLabApp(QWidget):
         _orig_parse_orca = c.parse_orca
         def _parse_orca_wrap(p): _orig_parse_orca(p); self._update_ui(); return c
         c.parse_orca = _parse_orca_wrap
+
+        # Connect to the global task manager so the UI auto-refreshes when
+        # any async work completes, and heavy buttons disable while busy.
+        try:
+            tm_sig = tasks().signals
+            tm_sig.busy_changed.connect(self._on_busy_changed)
+        except Exception:
+            pass
 
         # Molecule tab
         self.mol_combo.currentTextChanged.connect(lambda t: c.load(t))
@@ -2561,8 +3258,8 @@ class ChemLabApp(QWidget):
         self.atom_list.currentRowChanged.connect(
             lambda r: c.select(r) if 0 <= r < len(c.atoms) else None)
 
-        # Volume tab
-        self.calc_full_btn.clicked.connect(lambda: (c.calculate_full(), self._update_ui()))
+        # Volume tab — these buttons trigger heavy async work.
+        self.calc_full_btn.clicked.connect(lambda: c.calculate_full())
         self.elf_btn.clicked.connect(lambda: c.show_elf())
         self.spin_btn.clicked.connect(lambda: c.show_spin_density())
         self.loc_btn.clicked.connect(lambda: c.show_localized_orbitals())
@@ -2582,6 +3279,22 @@ class ChemLabApp(QWidget):
         self.anim_stop_btn.clicked.connect(lambda: c.stop())
         self.clear_vol_btn.clicked.connect(
             lambda: (c.clear_mo(), c.clear_layers(), c.clear_volume_slice(), c.stop()))
+
+        # Buttons that kick off heavy compute and should be disabled while busy.
+        self._heavy_buttons = [
+            self.calc_full_btn, self.elf_btn, self.spin_btn, self.loc_btn,
+            self.esp_btn, self.diff_btn, self.bulk_btn,
+        ]
+
+    def _on_busy_changed(self, n):
+        """Reflect task-manager busy state in the panel."""
+        busy = n > 0
+        for b in getattr(self, '_heavy_buttons', []) or []:
+            b.setEnabled(not busy)
+        # Refresh the info panel whenever the system becomes idle, so
+        # post-async state (atoms, charges, energies) is shown immediately.
+        if not busy:
+            self._update_ui()
 
     def _on_style(self, sn):
         for k, b in self.style_btns.items():
