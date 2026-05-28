@@ -11,6 +11,7 @@ Directory structure:
     ├── ctl           # Control: scan, rebuild, status, config
     ├── input         # Write a search query (triggers search on clunk)
     ├── OUTPUT        # Blocking read: search results stream
+    ├── PATH          # Blocking read: first (top) result path only
     ├── history       # JSON log of past queries + results
     ├── config        # JSON configuration (folders, top_k, etc.)
     ├── system        # System prompt / description of the agent
@@ -700,8 +701,127 @@ class EmbedSupplementaryOutputFile(SyntheticFile):
 
 
 # ---------------------------------------------------------------------------
+# PATH file: blocking read returning the first (top) result path
+# ---------------------------------------------------------------------------
+
+class EmbedPathFile(SyntheticFile):
+    """
+    Blocking read-only file that returns the single top result path from
+    the most recent search.
+
+    Where OUTPUT returns the full formatted list of results, PATH returns
+    just the first (highest-scoring) path, with a trailing newline. A read
+    blocks until a search has produced a result; it follows the same
+    WAITING -> READY -> CONSUMED lifecycle as the supplementary outputs so
+    each search makes the value re-readable.
+    """
+
+    def __init__(self, name: str = "PATH"):
+        super().__init__(name)
+        self._path: str = ""
+        self._ready = asyncio.Event()
+        self._consumed = False
+        self._lock = asyncio.Lock()
+
+    def set_path(self, path: str):
+        """Record the top result path and mark it ready for reading."""
+        self._path = path or ""
+        self._consumed = False
+        self._ready.set()
+
+    def clear(self):
+        self._path = ""
+        self._ready.clear()
+        self._consumed = False
+
+    async def read(self, fid: FidState, offset: int, count: int) -> bytes:
+        # Reset the gate at the start of a fresh read once consumed, so the
+        # next read blocks until a new search populates a path.
+        if offset == 0 and self._consumed:
+            async with self._lock:
+                if self._consumed:
+                    self._consumed = False
+                    self._ready.clear()
+
+        await self._ready.wait()
+
+        async with self._lock:
+            content = (self._path + "\n") if self._path else "\n"
+            data = content.encode()
+            chunk = data[offset:offset + count]
+            if offset + len(chunk) >= len(data):
+                self._consumed = True
+            return chunk
+
+    async def write(self, fid: FidState, offset: int, data: bytes) -> int:
+        raise PermissionError(f"{self.name} is read-only")
+
+
+# ---------------------------------------------------------------------------
 # The embedding agent
 # ---------------------------------------------------------------------------
+
+EMBED_HELP_TEXT = """\
+NAME
+    {name} — semantic code-search agent (embeddings + FAISS)
+
+SYNOPSIS
+    echo "scan /path/to/src -r" > /n/llm/{name}/ctl
+    echo "where is the retry logic?" > /n/llm/{name}/input
+    cat /n/llm/{name}/OUTPUT      # ranked results
+    cat /n/llm/{name}/PATH        # top result path only
+
+DESCRIPTION
+    Indexes Python source files and searches them semantically using
+    sentence-transformers embeddings and a FAISS index. Point it at one
+    or more folders with `scan`, then write a natural-language query to
+    `input`. OUTPUT returns the ranked, formatted matches; PATH returns
+    just the single best-matching file path (handy for plumbing into an
+    editor). The index and generated descriptions can be saved to and
+    loaded from disk.
+
+FILES
+    ctl           Control commands (see COMMANDS). Read it for status.
+    input         Write a natural-language query to trigger a search.
+    OUTPUT        Blocking read; formatted ranked results.
+    PATH          Blocking read; the top result's path only.
+    descriptions  Read/write the description database.
+    index_status  Read-only index statistics.
+    history       Query history as JSON.
+    config        Read/write configuration as JSON.
+    errors        Error log.
+    help          This file.
+
+COMMANDS
+    scan <folder> [-r]   Index a folder (add -r/--recursive for subdirs).
+    add <path>           Index a single file.
+    remove <path>        Remove a file from the index.
+    rebuild              Rebuild the index from scratch.
+    folders              List indexed folders.
+    stats                Print index statistics.
+    top_k [n]            Get/set the number of results returned.
+    save                 Save index + descriptions to disk.
+    load                 Load index + descriptions from disk.
+    load describe|search Load just the describe or search model.
+    unload [describe|search|all]   Unload model(s) to free memory.
+    clear                Clear the index and descriptions.
+
+EXAMPLES
+    # Index a project, then search
+    echo "scan ~/proj/src -r" > /n/llm/{name}/ctl
+    echo "function that parses 9P messages" > /n/llm/{name}/input
+    cat /n/llm/{name}/OUTPUT
+
+    # Open the best match in your editor
+    $EDITOR "$(cat /n/llm/{name}/PATH)"
+
+NOTES
+    Requires numpy, sentence-transformers, and FAISS (plus a describe
+    model). The first scan/search loads models, which can take a while
+    and use significant memory; use `unload` to free it. Reads on OUTPUT
+    and PATH block until a search produces a result.
+"""
+
 
 class EmbedAgent(SyntheticDir):
     """
@@ -713,6 +833,7 @@ class EmbedAgent(SyntheticDir):
         ├── ctl              # Control commands
         ├── input            # Write search queries
         ├── OUTPUT           # Blocking read: formatted search results
+        ├── PATH             # Blocking read: first (top) result path only
         ├── history          # JSON query history
         ├── config           # JSON configuration
         ├── descriptions     # Read/write description database
@@ -741,16 +862,21 @@ class EmbedAgent(SyntheticDir):
         self.supplementary_outputs: Dict[str, EmbedSupplementaryOutputFile] = {}
 
         self.output = StreamFile("OUTPUT")
+        self.path_file = EmbedPathFile("PATH")
         self.errors = QueueFile("errors")
 
         self.add(CtlFile("ctl", EmbedCtlHandler(self)))
         self.add(EmbedInputFile(self))
         self.add(self.output)
+        self.add(self.path_file)
         self.add(EmbedHistoryFile(self))
         self.add(EmbedConfigFile(self))
         self.add(DescriptionsFile(self))
         self.add(IndexStatusFile(self))
         self.add(self.errors)
+
+        from .meta_agent import HelpFile
+        self.add(HelpFile(EMBED_HELP_TEXT.format(name=self.name), name="help"))
 
         self.create_supplementary_output("CONTENT")
 
@@ -992,6 +1118,10 @@ class EmbedAgent(SyntheticDir):
             output_text = "\n".join(lines) + "\n"
             await self.output.append(output_text.encode())
 
+            # Publish the first (top) result path to the blocking PATH file.
+            if results:
+                self.path_file.set_path(results[0][1])
+
             self.query_history.append(QueryRecord(
                 query=query,
                 timestamp=time.time(),
@@ -1151,6 +1281,8 @@ class EmbedAgent(SyntheticDir):
         for sup in self.supplementary_outputs.values():
             sup.clear()
 
+        self.path_file.clear()
+
         await self.output.reset()
         self.state = EmbedAgentState.IDLE
         self.last_error = None
@@ -1205,4 +1337,3 @@ class EmbedAgent(SyntheticDir):
         """Clean shutdown."""
         self.describer.unload()
         self.embedder.unload()
-        

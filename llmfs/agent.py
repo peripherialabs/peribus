@@ -49,6 +49,74 @@ def estimate_message_tokens(msg: 'Message') -> int:
     return tokens
 
 
+AGENT_HELP_TEXT = """\
+NAME
+    {name} — conversational LLM agent
+
+SYNOPSIS
+    echo "your prompt" > /n/llm/{name}/input
+    cat /n/llm/{name}/OUTPUT
+
+DESCRIPTION
+    A text agent is a named LLM session with its own provider, model,
+    system prompt, history, and configuration. Write a prompt to `input`
+    and the streamed response appears on `OUTPUT`. History accumulates
+    across turns and is replayed to the provider so the conversation has
+    memory. Plumbing rules can extract fenced blocks from responses into
+    extra blocking output files. Multimodal input (images, audio, etc.)
+    is auto-detected when written to `input`.
+
+FILES
+    ctl       Control commands (see COMMANDS). Read it for status.
+    input     Write a prompt here to trigger generation.
+    OUTPUT    Blocking read; streams the assistant's response.
+    history   Conversation as JSON. `>` replaces, `>>` appends,
+              "clear" empties it.
+    config    Read/write configuration as JSON.
+    system    Read/write the system prompt.
+    rules     Read/write plumbing (extraction) rules.
+    state     Snapshot/restore the full agent state.
+    errors    Error log.
+    help      This file.
+    {{NAME}}    Supplementary outputs created by rules (CAPS = blocking).
+
+COMMANDS
+    provider <name> [model]   Switch provider (and optionally model).
+    model [name]              Get/set the model.
+    system [prompt]           Get/set the system prompt.
+    temperature [value]       Get/set sampling temperature.
+    max_tokens [n]            Get/set max output tokens.
+    max_history [n]           Get/set history cap (0 = unlimited).
+    max_context_tokens [n]    Get/set context-token budget (0 = off).
+    history on|off            Send history to the provider, or not.
+    register on|off           Auto-create rules for mounted machines.
+    exec <rule_index>         Run a plumbing rule against all history.
+    clearout <name>           Clear one supplementary output.
+    clear                     Clear history.
+    cancel                    Cancel the current generation.
+    retry                     Re-run the last user message.
+
+EXAMPLES
+    # Basic turn
+    echo "Explain 9P in one sentence" > /n/llm/{name}/input
+    cat /n/llm/{name}/OUTPUT
+
+    # Switch model, then ask
+    echo "model gpt-4o" > /n/llm/{name}/ctl
+    echo "Hi there" > /n/llm/{name}/input
+
+    # Inspect status / history
+    cat /n/llm/{name}/ctl
+    cat /n/llm/{name}/history
+
+NOTES
+    Requires the relevant provider API key in the environment
+    (e.g. ANTHROPIC_API_KEY, OPENAI_API_KEY, GEMINI_API_KEY).
+    History persists in memory for the life of the agent; use
+    `clear` or write to `history` to reset it.
+"""
+
+
 class AgentState(Enum):
     """Agent state"""
     IDLE = "idle"           # Waiting for input
@@ -1036,7 +1104,17 @@ class Agent(SyntheticDir):
         self.add(AgentRulesFile(self))
         self.add(AgentStateFile(self))
         self.add(self.errors)
-    
+
+        # Documentation. Imported locally to avoid a circular import:
+        # meta_agent imports from agent, so agent can't import meta_agent
+        # at module scope.
+        from .meta_agent import HelpFile
+        self.add(HelpFile(self._help_text(), name="help"))
+
+    def _help_text(self) -> str:
+        """Human-readable docs for a text agent (cat $agent/help)."""
+        return AGENT_HELP_TEXT.format(name=self.agent_name)
+
     def get_effective_system(self) -> str:
         """
         Build the complete system prompt: base system + supplementary contexts.

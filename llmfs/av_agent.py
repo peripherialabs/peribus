@@ -614,6 +614,74 @@ class AVAudioInFile(SyntheticFile):
 # ─── Main Agent ─────────────────────────────────────────────────────
 
 
+AV_HELP_TEXT = """\
+NAME
+    {name} — live audio/video agent (Gemini Live API)
+
+SYNOPSIS
+    echo "start" > /n/llm/{name}/ctl
+    echo "Hello, can you hear me?" > /n/llm/{name}/input
+    cat /n/llm/{name}/OUTPUT      # text responses
+    cat /n/llm/{name}/AUDIO       # raw PCM audio out
+
+DESCRIPTION
+    A real-time audio/visual agent backed by the Gemini Live API over a
+    raw WebSocket (no SDK, for lower latency). Once started it captures
+    microphone audio, optionally sends camera or screen video, and plays
+    the model's spoken replies. Text written to `input` is injected into
+    the live session; `context` adds info without prompting a reply.
+    Function-call code is delivered to CODE.
+
+FILES
+    ctl       Control commands (see COMMANDS). Read it for status.
+    input     Write text to send into the live session (triggers reply).
+    context   Write context/info here (no reply triggered).
+    OUTPUT    Blocking read; streamed text responses.
+    AUDIO     Blocking read; raw PCM audio output from the model.
+    CODE      Blocking read; code emitted by function-tool calls.
+    mic       Write raw PCM audio to send to the model.
+    history   Conversation as JSON.
+    config    Read/write configuration as JSON.
+    system    Read/write the system prompt.
+    status    Real-time status (state, audio levels, devices).
+    errors    Error log.
+    help      This file.
+
+COMMANDS
+    start                Connect and begin the live session.
+    stop                 End the session.
+    restart              Stop then start.
+    model [name]         Get/set the model.
+    voice [name]         Get/set the voice (see `voices`).
+    voices               List available voices.
+    mode|video [m]       Get/set video source: none, camera, screen.
+    system [prompt]      Get/set the system prompt.
+    mute | unmute        Toggle local audio playback.
+    devices              List audio input/output devices.
+    input [index]        Get/set input device (restart to apply).
+    output [index]       Get/set output device (restart to apply).
+    clear                Clear history.
+
+EXAMPLES
+    # Start a voice session with the screen shared
+    echo "mode screen" > /n/llm/{name}/ctl
+    echo "start" > /n/llm/{name}/ctl
+    echo "What's on my screen?" > /n/llm/{name}/input
+    cat /n/llm/{name}/OUTPUT
+
+    # Pick a voice and list devices
+    echo "voices" > /n/llm/{name}/ctl
+    echo "voice Puck" > /n/llm/{name}/ctl
+    echo "devices" > /n/llm/{name}/ctl
+
+NOTES
+    Requires GEMINI_API_KEY and the `websockets` package; live audio I/O
+    needs PyAudio, and video needs OpenCV + Pillow. Device changes take
+    effect on the next `start`/`restart`. Reading AUDIO/CODE/OUTPUT
+    blocks until data is produced.
+"""
+
+
 class AVAgent(SyntheticDir):
     """
     AudioVisual Agent using Gemini Live API via raw WebSocket.
@@ -680,6 +748,9 @@ class AVAgent(SyntheticDir):
         self.add(self.audio_out_file)
         self.add(AVAudioInFile(self))
         self.add(self.errors)
+
+        from .meta_agent import HelpFile
+        self.add(HelpFile(AV_HELP_TEXT.format(name=self.agent_name), name="help"))
 
     def _check_dependencies(self):
         if not WEBSOCKET_AVAILABLE:

@@ -439,6 +439,67 @@ class TSAudioOutFile(SyntheticFile):
                     pass
 
 
+TS_HELP_TEXT = """\
+NAME
+    {name} — text-to-speech / speech-to-text agent (Cartesia)
+
+SYNOPSIS
+    echo "Hello world" > /n/llm/{name}/input
+    cat /n/llm/{name}/AUDIO_OUT          # generated speech (PCM)
+
+    cat /n/llm/{name}/audio.wav > /n/llm/{name}/audio_in
+    cat /n/llm/{name}/OUTPUT             # transcribed text
+
+DESCRIPTION
+    A bidirectional audio/text agent backed by Cartesia. Text written to
+    `input` is synthesized to speech, readable from AUDIO_OUT. Audio
+    written to `audio_in` is transcribed to text, readable from OUTPUT.
+    An optional `auto` mode wires the local microphone and speakers
+    together for hands-free use.
+
+FILES
+    ctl         Control commands (see COMMANDS). Read it for status.
+    input       Write text here → produces speech on AUDIO_OUT.
+    AUDIO_OUT   Blocking read; generated audio from input text.
+    audio_in    Write audio here → transcribed to OUTPUT.
+    OUTPUT      Blocking read; transcribed text from audio_in.
+    config      Read/write configuration as JSON.
+    status      Real-time status (levels, devices, auto mode).
+    errors      Error log.
+    help        This file.
+
+COMMANDS
+    auto [on|off]    Get/toggle hands-free mic→speaker mode.
+    voice [id]       Get/set the TTS voice.
+    model [name]     Get/set the model.
+    language [code]  Get/set the language.
+    devices          List audio input/output devices.
+    input [index]    Get/set input device.
+    output [index]   Get/set output device.
+    start            Start the live audio loop.
+    stop             Stop the live audio loop.
+    restart          Stop then start.
+    reset            Reset state.
+    status           Print current status.
+    voices           List available voices.
+
+EXAMPLES
+    # Synthesize speech
+    echo "Good morning" > /n/llm/{name}/input
+    cat /n/llm/{name}/AUDIO_OUT > out.pcm
+
+    # Pick a voice, enable hands-free mode
+    echo "voices" > /n/llm/{name}/ctl
+    echo "voice <voice_id>" > /n/llm/{name}/ctl
+    echo "auto on" > /n/llm/{name}/ctl
+
+NOTES
+    Requires the `cartesia` package and a Cartesia API key in the
+    environment. Audio device I/O depends on the local audio stack.
+    AUDIO_OUT and OUTPUT block until their data is ready.
+"""
+
+
 class TSAgent(SyntheticDir):
     """
     Text-to-Speech Agent
@@ -526,6 +587,9 @@ class TSAgent(SyntheticDir):
         # Error queue
         self.errors = QueueFile("errors")
         self.add(self.errors)
+
+        from .meta_agent import HelpFile
+        self.add(HelpFile(TS_HELP_TEXT.format(name=self.name), name="help"))
     
     async def set_auto_mode(self, enabled: bool):
         """Enable/disable auto mode"""

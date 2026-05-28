@@ -334,6 +334,65 @@ QUALITY BAR
 # Meta-agent ctl handler
 # ---------------------------------------------------------------------------
 
+META_HELP_TEXT = """\
+NAME
+    {name} — meta-agent that writes and mounts new agents
+
+SYNOPSIS
+    echo "create a weather agent" > /n/llm/{name}/input
+    cat /n/llm/{name}/OUTPUT
+    echo "build weather" > /n/llm/{name}/ctl
+
+DESCRIPTION
+    The meta-agent is a text agent specialised for generating other
+    LLMFS agents. Describe the agent you want; it streams a complete
+    Python module to OUTPUT, and a built-in plumbing rule extracts the
+    ```python``` block into the supplementary output PYTHON. The `build`
+    command then writes that module to disk, imports it, calls its
+    create(name) factory, and mounts the result under the LLMFS root.
+    All standard text-agent files and commands also apply.
+
+FILES
+    ctl       Control commands (see COMMANDS). Read it for status.
+    input     Describe the agent you want generated.
+    OUTPUT    Blocking read; streams the generated module + preamble.
+    PYTHON    Blocking read; the extracted ```python``` module.
+    history   Conversation as JSON.
+    config    Read/write configuration as JSON.
+    system    Read/write the system prompt (defaults to the meta prompt).
+    rules     Plumbing rules (the python-extraction rule is pre-installed).
+    state     Snapshot/restore the full agent state.
+    errors    Error log (import failures land here).
+    help      This file.
+
+COMMANDS
+    build <name>    Persist + import + mount the last generated module.
+    save <name>     Persist the last module to disk without mounting.
+    load <name>     Re-import and mount a previously saved agent.
+    list            List saved agents on disk.
+    forget <name>   Delete a saved agent file from disk.
+    (plus all base text-agent commands: provider, model, system, ...)
+
+EXAMPLES
+    # Generate, then build and mount
+    echo "create an agent that reverses text" > /n/llm/{name}/input
+    cat /n/llm/{name}/OUTPUT
+    echo "build reverser" > /n/llm/{name}/ctl
+    echo "hello" > /n/llm/reverser/input
+
+    # Re-load a saved agent later
+    echo "list" > /n/llm/{name}/ctl
+    echo "load reverser" > /n/llm/{name}/ctl
+
+NOTES
+    Generated modules are saved under $LLMFS_AGENTS_DIR (default
+    ~/.llmfs/agents) and re-loaded at startup. A module must expose a
+    module-level create(name) factory returning a SyntheticDir. If an
+    import or create() fails, the error is posted to `errors` and the
+    file is left on disk for inspection.
+"""
+
+
 class MetaCtlHandler(AgentCtlHandler):
     """
     Extends the standard agent ctl with build/save/load/list commands.
@@ -450,6 +509,10 @@ class MetaAgent(Agent):
         self._fs_root = fs_root
 
         self.agents_dir: Path = get_agents_dir()
+
+    def _help_text(self) -> str:
+        """Meta-agent docs (overrides the base text-agent help)."""
+        return META_HELP_TEXT.format(name=self.agent_name)
 
     # ── Helpers ─────────────────────────────────────────────────────────
 
@@ -660,4 +723,3 @@ def _extract_python_block(text: str) -> Optional[str]:
     if not m:
         return None
     return m[-1].group(1)
-    
