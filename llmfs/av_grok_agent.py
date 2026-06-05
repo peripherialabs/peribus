@@ -78,11 +78,14 @@ CHUNK_SIZE = 1024
 
 # Grok configuration
 GROK_WEBSOCKET_URL = "wss://api.x.ai/v1/realtime"
+# The model MUST be passed as a query parameter on the connection URL.
+# "grok-voice-latest" always points to the newest model
+# (currently grok-voice-think-fast-1.0). Pin to a versioned name in prod.
+GROK_MODEL = "grok-voice-fast-1.0" #think-fast-1.0 is not stable
 
-# Available voices for Grok
+# Available voices for Grok (current API — lowercase identifiers)
 GROK_VOICES = [
-    "Ara", "Cora", "Sage", "Ember", "Ivy",
-    "Kai", "Nova", "Sol", "Tara", "Vale"
+    "eve", "ara", "rex", "sal", "leo"
 ]
 
 
@@ -114,7 +117,7 @@ class Message:
 @dataclass
 class GrokAVConfig:
     """Configuration for Grok AV agent"""
-    voice: str = "Ara"
+    voice: str = "ara"
     video_mode: str = "none"
     system: Optional[str] = None
     functions: List[Dict] = field(default_factory=list)
@@ -140,7 +143,7 @@ class GrokAVConfig:
     @classmethod
     def from_dict(cls, d: dict) -> 'GrokAVConfig':
         return cls(
-            voice=d.get("voice", "Ara"),
+            voice=d.get("voice", "ara"),
             video_mode=d.get("video_mode", "none"),
             system=d.get("system"),
             functions=d.get("functions", []),
@@ -182,8 +185,11 @@ class GrokAVCtlHandler(CtlHandler):
 
         elif cmd == "voice":
             if arg:
-                if arg not in GROK_VOICES:
-                    raise ValueError(f"Unknown voice: {arg}. Available: {', '.join(GROK_VOICES)}")
+                # Built-in voices are lowercase (eve, ara, rex, sal, leo).
+                # Normalize a known built-in to its canonical lowercase form;
+                # otherwise accept it verbatim as a custom voice ID.
+                if arg.lower() in GROK_VOICES:
+                    arg = arg.lower()
                 self.agent.config.voice = arg
                 return f"Voice set to {arg}"
             return self.agent.config.voice
@@ -972,8 +978,12 @@ class GrokAVAgent(SyntheticDir):
 
             api_key = os.getenv("XAI_API_KEY")
 
+            # The model MUST be supplied as a query parameter on the URL.
+            # Connecting without it no longer works against the current API.
+            connect_url = f"{GROK_WEBSOCKET_URL}?model={GROK_MODEL}"
+
             self._websocket = await websocket_connect(
-                uri=GROK_WEBSOCKET_URL,
+                uri=connect_url,
                 additional_headers={"Authorization": f"Bearer {api_key}"},
             )
 
@@ -1030,9 +1040,27 @@ class GrokAVAgent(SyntheticDir):
             "session": {
                 "voice": self.config.voice,
                 "instructions": self.config.system or "You are a helpful AI assistant.",
-                "input_audio_format": "pcm16",
-                "output_audio_format": "pcm16",
-                "input_audio_transcription": {"model": "whisper-1"},
+                # Current API: audio format/rate and transcription live under
+                # a nested `audio` object. The old flat fields
+                # (input_audio_format / output_audio_format / top-level
+                # input_audio_transcription) are silently ignored by xAI.
+                "audio": {
+                    "input": {
+                        "format": {
+                            "type": "audio/pcm",
+                            "rate": SEND_SAMPLE_RATE,
+                        },
+                        "transcription": {
+                            "model": "grok-transcribe",
+                        },
+                    },
+                    "output": {
+                        "format": {
+                            "type": "audio/pcm",
+                            "rate": RECEIVE_SAMPLE_RATE,
+                        },
+                    },
+                },
                 "turn_detection": {
                     "type": "server_vad",
                     "threshold": self.config.turn_detection_threshold,
